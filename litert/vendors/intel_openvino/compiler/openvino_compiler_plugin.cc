@@ -34,6 +34,8 @@
 #include "openvino/frontend/tensorflow_lite/frontend.hpp"
 #include "openvino/frontend/tensorflow_lite/graph_iterator.hpp"
 #include "openvino/openvino.hpp"
+#include "openvino/pass/manager.hpp"
+#include "openvino/pass/constant_folding.hpp"
 #include "openvino/runtime/core.hpp"
 #include "absl/strings/str_format.h"  // from @com_google_absl
 #include "litert/c/internal/litert_logging.h"
@@ -595,6 +597,11 @@ LiteRtStatus LiteRtCompilerPluginCompile(
         LITERT_LOG(LITERT_INFO, "Model loaded");
         auto ov_model = tflite_fe->convert(input_model);
 
+{
+ov::pass::Manager manager;
+manager.register_pass<ov::pass::ConstantFolding>();
+manager.run_passes(ov_model);
+}
         // Run NPU-specific optimization passes.
         context.OptimizeModel(ov_model);
 
