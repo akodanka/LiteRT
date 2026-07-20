@@ -15,6 +15,8 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <filesystem>  // NOLINT
+#include <fstream>
 #include <ios>
 #include <limits>
 #include <memory>
@@ -22,6 +24,8 @@
 #include <streambuf>
 #include <string>
 #include <string_view>
+#include <system_error>
+#include <unordered_map>
 #include <utility>
 #include <vector>
 
@@ -524,6 +528,15 @@ LiteRtStatus LiteRtCompilerPluginCompile(
     litert::openvino::OpenVinoGlobalGraph global_graph;
     const char* embed_env = std::getenv("LITERT_OV_EMBED_WEIGHTS");
     const bool share_weights = embed_env != nullptr && embed_env[0] == '1';
+    // Single source_id for the whole shared pool; the per-weight bin_offset
+    // (pool-relative byte offset, unique per pool entry) is the descriptor
+    // offset NPUW keys on. 0 would disable identity publishing, so use 1.
+    constexpr std::size_t kLiteRtBankSourceId = 1;
+    // BufferId -> pool byte offset, published to the TFLite frontend on the NPU
+    // path so weight identity travels on each Constant's buffer descriptor
+    // (ov::weight_sharing). Derived from the serialized pool layout below.
+    auto buffer_id_to_offset =
+        std::make_shared<std::unordered_map<int32_t, std::size_t>>();
     if (share_weights) {
       for (int p = 0; p < num_partitions; ++p) {
         auto subgraph = model.Subgraph(p);
@@ -538,6 +551,10 @@ LiteRtStatus LiteRtCompilerPluginCompile(
             std::string(reinterpret_cast<const char*>(bytes.data()),
                         bytes.size()));
       }
+      // Offsets that match exactly how Serialize() lays out the contiguous
+      // pool (ascending buffer_id). NPUW/dispatch resolve each weight at
+      // pool_base + bin_offset, so the published offsets must equal these.
+      *buffer_id_to_offset = global_graph.ComputePoolOffsets();
     }
 
     ov::Core core;
@@ -555,10 +572,25 @@ LiteRtStatus LiteRtCompilerPluginCompile(
       litert::Expected<litert::compiler::Subgraph> expected_subgraph =
           model.Subgraph(partition_idx);
       if (expected_subgraph.HasValue()) {
+        // On the NPU sharing path weights stay Constants and their identity is
+        // published on each Constant's buffer descriptor. That requires the map
+        // to be attached to the delegate BEFORE conversion, so keep a typed
+        // handle to the delegate.
+        auto graph_delegate_typed =
+            std::make_shared<litert::openvino::GraphIteratorDelegate>(
+                compiler_plugin->ctx(), &expected_subgraph.Value());
+        const bool npu_share = share_weights && context.Device() == "NPU";
+        if (npu_share) {
+          // Publish weight-sharing identity (source_id + pool-relative
+          // bin_offset) to the TFLite frontend so it builds descriptor-backed
+          // Constants. NPUW then resolves each Constant's origin straight from
+          // that descriptor (ov::weight_sharing) -- no Constant->Parameter
+          // surgery and no MODEL_SHARING_CONTEXT/Context crossing the boundary.
+          graph_delegate_typed->SetSharedContextIdentity(buffer_id_to_offset,
+                                                         kLiteRtBankSourceId);
+        }
         std::shared_ptr<ov::frontend::tensorflow_lite::GraphIterator>
-            graph_delegate =
-                std::make_shared<litert::openvino::GraphIteratorDelegate>(
-                    compiler_plugin->ctx(), &expected_subgraph.Value());
+            graph_delegate = graph_delegate_typed;
         auto input_model = tflite_fe->load(graph_delegate);
         LITERT_LOG(LITERT_INFO, "Model loaded");
         auto ov_model = tflite_fe->convert(input_model);
@@ -569,23 +601,32 @@ LiteRtStatus LiteRtCompilerPluginCompile(
         ov::AnyMap configs = context.ConfigsMap();
         std::map<uint32_t, uint32_t> const_map;
         if (share_weights) {
-          // Weight sharing is currently GPU-only. Other devices (NPU/CPU) are a
-          // later patchset; fail loudly rather than emit an unshared model.
-          if (context.Device() != "GPU") {
+          // Two consumption strategies over one OVGLOBAL container (see design
+          // §8): NPU imports weightless and mmaps the pool via the buffer
+          // descriptor identity published above (const_map stays empty); GPU
+          // promotes weights to Parameters bound to a shared USM pool at
+          // dispatch (const_map records input_index -> BufferId).
+          if (context.Device() == "GPU") {
+            const size_t converted =
+                litert::openvino::ConvertWeightsToParameters(
+                    ov_model, weight_bank, &const_map);
+            LITERT_LOG(LITERT_INFO,
+                       "Weight sharing (GPU): converted %zu weights to "
+                       "parameters in partition %d",
+                       converted, partition_idx);
+          } else if (npu_share) {
+            LITERT_LOG(LITERT_INFO,
+                       "Weight sharing (NPU): partition %d keeps weights as "
+                       "descriptor-tagged Constants (weightless import)",
+                       partition_idx);
+          } else {
+            // CPU or any other device: no shared-weight strategy exists.
             LITERT_LOG(LITERT_ERROR,
-                       "Weight sharing is only supported on GPU (partition %d "
-                       "targets '%s')",
+                       "Weight sharing is only supported on NPU and GPU "
+                       "(partition %d targets '%s')",
                        partition_idx, context.Device().c_str());
             return kLiteRtStatusErrorUnsupported;
           }
-          // Convert weights to Parameters bound to the shared bank at dispatch;
-          // const_map records input_index -> BufferId.
-          const size_t converted = litert::openvino::ConvertWeightsToParameters(
-              ov_model, weight_bank, &const_map);
-          LITERT_LOG(LITERT_INFO,
-                     "Weight sharing: converted %zu weights to parameters "
-                     "in partition %d",
-                     converted, partition_idx);
         }
 
         // Compile using the per-partition device and properties.
@@ -594,10 +635,45 @@ LiteRtStatus LiteRtCompilerPluginCompile(
         auto compiled_model =
             core.compile_model(ov_model, context.Device(), configs);
 
-        CustomOStreamBuf obuf;
-        std::ostream oss(&obuf);
-        compiled_model.export_model(oss);
-        LITERT_LOG(LITERT_INFO, "Model export done");
+        // Export to a raw blob. On the NPU sharing path route the export
+        // through a real std::ofstream: some NPU plugin versions only emit a
+        // weightless side-car when the export stream is file-backed; the
+        // in-memory CustomOStreamBuf otherwise triggers the "embed everything"
+        // fallback, which would defeat zero-copy sharing. The .tflite layout is
+        // unchanged either way. GPU and non-shared paths keep the in-memory
+        // export (they need the baked weights).
+        std::string raw_blob;
+        if (npu_share) {
+          std::error_code ec_tmp;
+          const char* export_dir_env = std::getenv("LITERT_OV_EXPORT_DIR");
+          const std::string blob_dir =
+              export_dir_env != nullptr
+                  ? std::string(export_dir_env)
+                  : std::filesystem::temp_directory_path(ec_tmp).string();
+          const auto blob_path = absl::StrFormat("%s/ov_export_p%d.blob",
+                                                 blob_dir, partition_idx);
+          {
+            std::ofstream out(blob_path, std::ios::binary);
+            compiled_model.export_model(out);
+          }
+          std::ifstream in(blob_path, std::ios::binary | std::ios::ate);
+          const auto blob_size = static_cast<size_t>(in.tellg());
+          in.seekg(0, std::ios::beg);
+          raw_blob.resize(blob_size);
+          if (blob_size > 0) {
+            in.read(&raw_blob[0], blob_size);
+          }
+          std::filesystem::remove(blob_path, ec_tmp);
+          LITERT_LOG(LITERT_INFO,
+                     "Model export done (weightless, via file, %zu bytes)",
+                     raw_blob.size());
+        } else {
+          CustomOStreamBuf obuf;
+          std::ostream oss(&obuf);
+          compiled_model.export_model(oss);
+          raw_blob = obuf.drain_str();
+          LITERT_LOG(LITERT_INFO, "Model export done");
+        }
 
         // Resolve the graph type enum corresponding to context.Device() so
         // the dispatcher can import on the same device.  We translate the
@@ -622,14 +698,14 @@ LiteRtStatus LiteRtCompilerPluginCompile(
           subgraph.const_map = std::move(const_map);
           subgraph.payload =
               litert::openvino::MakeBytecodeHeader(graph_backend_enum) +
-              obuf.drain_str();
+              raw_blob;
           global_graph.subgraphs.emplace(graph_name, std::move(subgraph));
         } else {
           // Non-shared path: standalone per-partition bytecode (device header +
           // baked-weights payload).
           result->byte_code[partition_idx] =
               litert::openvino::MakeBytecodeHeader(graph_backend_enum) +
-              obuf.drain_str();
+              raw_blob;
         }
 
         result->graph_names[partition_idx] = graph_name;

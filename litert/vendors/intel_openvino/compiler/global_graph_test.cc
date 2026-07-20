@@ -88,6 +88,64 @@ TEST(GlobalGraphTest, BankBytesSumsPool) {
   EXPECT_EQ(graph.BankBytes(), 4u + 10u);
 }
 
+// ComputePoolOffsets returns ascending-buffer_id byte offsets that match the
+// contiguous pool layout Serialize() writes.
+TEST(GlobalGraphTest, ComputePoolOffsetsMatchesLayout) {
+  const OpenVinoGlobalGraph graph = MakeSample();
+  const auto offsets = graph.ComputePoolOffsets();
+  // buffers: id 0 (4 bytes) then id 7 (10 bytes) in ascending id order.
+  ASSERT_EQ(offsets.size(), 2u);
+  EXPECT_EQ(offsets.at(0), 0u);
+  EXPECT_EQ(offsets.at(7), 4u);
+}
+
+// ParseHeader locates the pool and each payload by offset/size without copying,
+// and the reported offsets address the same bytes the full Parse returns.
+TEST(GlobalGraphTest, ParseHeaderLocatesPoolAndPayloads) {
+  const OpenVinoGlobalGraph in = MakeSample();
+  const std::string blob = in.Serialize();
+  const auto* data = reinterpret_cast<const uint8_t*>(blob.data());
+
+  auto header = OpenVinoGlobalGraph::ParseHeader(data, blob.size());
+  ASSERT_TRUE(header.HasValue());
+  const auto& h = header.Value();
+
+  // Pool region is consistent and holds exactly BankBytes().
+  EXPECT_EQ(h.pool_size, in.BankBytes());
+  EXPECT_LE(h.pool_data_offset + h.pool_size, blob.size());
+
+  // Buffer index offsets match ComputePoolOffsets, and the bytes at
+  // pool_data_offset + pool_offset equal the original buffer bytes.
+  const auto offsets = in.ComputePoolOffsets();
+  ASSERT_EQ(h.buffer_index.size(), in.buffers.size());
+  for (const auto& [id, loc] : h.buffer_index) {
+    EXPECT_EQ(loc.pool_offset, offsets.at(static_cast<int32_t>(id)));
+    const std::string bytes(
+        reinterpret_cast<const char*>(data + h.pool_data_offset +
+                                      loc.pool_offset),
+        loc.size);
+    EXPECT_EQ(bytes, in.buffers.at(id));
+  }
+
+  // Payload spans point at the original payload bytes.
+  ASSERT_EQ(h.subgraphs.size(), in.subgraphs.size());
+  for (const auto& [name, sv] : h.subgraphs) {
+    const std::string payload(
+        reinterpret_cast<const char*>(data + sv.payload_offset),
+        sv.payload_size);
+    EXPECT_EQ(payload, in.subgraphs.at(name).payload);
+    EXPECT_EQ(sv.const_map, in.subgraphs.at(name).const_map);
+  }
+}
+
+// ParseHeader rejects a corrupt blob rather than over-reading.
+TEST(GlobalGraphTest, ParseHeaderRejectsTruncated) {
+  const std::string blob = MakeSample().Serialize();
+  auto header = OpenVinoGlobalGraph::ParseHeader(
+      reinterpret_cast<const uint8_t*>(blob.data()), blob.size() - 1);
+  EXPECT_FALSE(header.HasValue());
+}
+
 // An empty container round-trips (magic + zero counts).
 TEST(GlobalGraphTest, EmptyRoundTrips) {
   OpenVinoGlobalGraph in;

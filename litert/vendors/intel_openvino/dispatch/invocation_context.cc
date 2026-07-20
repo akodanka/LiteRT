@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <exception>
+#include <functional>
 #include <ios>
 #include <istream>
 #include <map>
@@ -29,6 +30,12 @@
 #include <string>
 #include <utility>
 #include <vector>
+
+#if !defined(_WIN32)
+#include <unistd.h>  // dup
+#endif
+
+#include "openvino/runtime/file_handle.hpp"
 
 #include "openvino/core/any.hpp"
 #include "openvino/runtime/compiled_model.hpp"
@@ -141,35 +148,52 @@ LiteRtDispatchInvocationContextT::Create(
     const LiteRtMemBuffer* exec_bytecode_buffer, const char* function_name,
     int num_inputs, int num_outputs,
     const IntelOpenVinoOptions* intel_openvino_opts) {
-  const void* exec_bytecode_ptr =
+  // The container (or raw bytecode) starts at base_addr + offset.
+  const uint8_t* container =
       static_cast<const uint8_t*>(exec_bytecode_buffer->base_addr) +
       exec_bytecode_buffer->offset;
-  auto exec_bytecode_size = exec_bytecode_buffer->size;
+  const size_t container_size = exec_bytecode_buffer->size;
+  const void* exec_bytecode_ptr = container;
+  auto exec_bytecode_size = container_size;
 
   // GlobalGraph weight sharing: the compiler returns ONE container blob for all
   // partitions (magic "OVGLOBAL") holding a shared buffer pool + per-subgraph
-  // {payload, const_map, device}. Parse it and select THIS partition's subgraph
-  // (by function_name, which the plugin sets to the graph name; fall back to the
-  // sole/first subgraph). The subgraph's weights are resolved against the pool at
-  // import below. Non-shared models skip this and use the raw bytecode directly.
+  // {payload, const_map, device}. Select THIS partition's subgraph (by
+  // function_name, which the plugin sets to the graph name; fall back to the
+  // sole/first subgraph). Two consumption strategies over the one container:
+  //
+  //  * NPU + fd-backed model (this design, §7): parse the header ONLY (no pool
+  //    copy) and mmap the pool region straight out of the model file's fd at
+  //    import; the payload is imported weightless. Zero weight copies.
+  //  * GPU (or NPU without an fd): full Parse (copies the pool) and bind USM
+  //    views below.
+  //
+  // Non-shared models skip this and use the raw bytecode directly.
   std::optional<litert::openvino::OpenVinoGlobalGraph> global_graph;
   std::map<uint32_t, uint32_t> selected_const_map;
   std::optional<LiteRtIntelOpenVinoGraphBackend> selected_device;
   std::vector<uint8_t> selected_payload;
-  if (litert::openvino::OpenVinoGlobalGraph::HasMagic(
-          static_cast<const uint8_t*>(exec_bytecode_ptr), exec_bytecode_size)) {
+  // NPU fd-backed weightless region (Option B). npu_fd_shared gates it.
+  bool npu_fd_shared = false;
+  size_t pool_file_offset = 0;
+  size_t pool_region_size = 0;
+  if (litert::openvino::OpenVinoGlobalGraph::HasMagic(container,
+                                                      container_size)) {
+    // Header-only parse first: cheap, copies no pool/payload bytes. This is
+    // enough to select the subgraph and decide the consumption strategy.
     LITERT_ASSIGN_OR_RETURN(
-        global_graph, litert::openvino::OpenVinoGlobalGraph::Parse(
-                          static_cast<const uint8_t*>(exec_bytecode_ptr),
-                          exec_bytecode_size));
+        litert::openvino::OpenVinoGlobalGraph::HeaderView header,
+        litert::openvino::OpenVinoGlobalGraph::ParseHeader(container,
+                                                           container_size));
 
-    const litert::openvino::OpenVinoGlobalGraph::Subgraph* selected = nullptr;
+    const litert::openvino::OpenVinoGlobalGraph::HeaderView::SubgraphView*
+        selected = nullptr;
     if (function_name != nullptr && function_name[0] != '\0') {
-      auto it = global_graph->subgraphs.find(function_name);
-      if (it != global_graph->subgraphs.end()) selected = &it->second;
+      auto it = header.subgraphs.find(function_name);
+      if (it != header.subgraphs.end()) selected = &it->second;
     }
-    if (selected == nullptr && !global_graph->subgraphs.empty()) {
-      selected = &global_graph->subgraphs.begin()->second;  // fall back to first
+    if (selected == nullptr && !header.subgraphs.empty()) {
+      selected = &header.subgraphs.begin()->second;  // fall back to first
     }
     if (selected == nullptr) {
       return litert::Error(kLiteRtStatusErrorRuntimeFailure,
@@ -178,15 +202,54 @@ LiteRtDispatchInvocationContextT::Create(
     LITERT_LOG(LITERT_INFO,
                "GlobalGraph: selected subgraph '%s' (%zu byte payload) for "
                "function_name '%s'",
-               selected->name.c_str(), selected->payload.size(),
+               selected->name.c_str(), selected->payload_size,
                function_name ? function_name : "(null)");
     selected_const_map = selected->const_map;
     selected_device =
         static_cast<LiteRtIntelOpenVinoGraphBackend>(selected->device);
-    // Copy the selected payload into an owned buffer; we import from it below.
-    selected_payload.assign(selected->payload.begin(), selected->payload.end());
-    exec_bytecode_ptr = selected_payload.data();
-    exec_bytecode_size = selected_payload.size();
+    const std::string selected_device_str =
+        litert::openvino::GraphBackendToString(*selected_device);
+
+    if (selected_device_str == "NPU" && exec_bytecode_buffer->fd >= 0) {
+      // Zero-copy NPU path: stream the payload in place (no copy) and mmap the
+      // pool region out of the fd at import. The pool's absolute offset in the
+      // file is the blob's base in the file + the bytecode start relative to
+      // that base + the pool's start within the container.
+      npu_fd_shared = true;
+      pool_file_offset = exec_bytecode_buffer->alloc_base_file_offset +
+                         exec_bytecode_buffer->offset + header.pool_data_offset;
+      pool_region_size = header.pool_size;
+      exec_bytecode_ptr = container + selected->payload_offset;
+      exec_bytecode_size = selected->payload_size;
+      LITERT_LOG(LITERT_INFO,
+                 "GlobalGraph(NPU,fd): pool_file_offset=%zu pool_size=%zu "
+                 "(fd=%d)",
+                 pool_file_offset, pool_region_size, exec_bytecode_buffer->fd);
+    } else {
+      // GPU or NPU-without-fd: full Parse copies the pool for the USM bind path.
+      if (selected_device_str == "NPU") {
+        // fd absent: fd-backed sharing is unavailable. Buffer-backed sharing is
+        // a separate design (Document 2); log rather than silently disable.
+        LITERT_LOG(LITERT_WARNING,
+                   "GlobalGraph(NPU): model is not fd-backed (fd=%d); "
+                   "fd-backed zero-copy weight sharing is unavailable for this "
+                   "load. See design_weight_sharing_2_buffer_backed.md.",
+                   exec_bytecode_buffer->fd);
+      }
+      LITERT_ASSIGN_OR_RETURN(global_graph,
+                              litert::openvino::OpenVinoGlobalGraph::Parse(
+                                  container, container_size));
+      auto it = global_graph->subgraphs.find(selected->name);
+      if (it == global_graph->subgraphs.end()) {
+        return litert::Error(kLiteRtStatusErrorRuntimeFailure,
+                             "GlobalGraph: subgraph vanished after full parse");
+      }
+      // Copy the selected payload into an owned buffer; we import from it below.
+      selected_payload.assign(it->second.payload.begin(),
+                              it->second.payload.end());
+      exec_bytecode_ptr = selected_payload.data();
+      exec_bytecode_size = selected_payload.size();
+    }
   }
 
   // If the compiler embedded a self-describing header, honor the device
@@ -269,15 +332,44 @@ LiteRtDispatchInvocationContextT::Create(
                          "Failed to open model bytecode stream");
   }
 
-  // Resolve a GlobalGraph subgraph's weights against the shared pool: on GPU the
-  // weights are Parameters imported plainly, then bound to views into a shared
-  // usm-host buffer (below). A non-shared model (no container) imports its
-  // payload directly. Weight sharing is GPU-only; non-GPU shared models are
-  // rejected at compile time (a later patchset adds the NPU arm).
+  // Resolve a GlobalGraph subgraph's weights against the shared pool.
+  //   * NPU + fd (npu_fd_shared): import weightless and hand NPUW a handle
+  //     provider (dup of the model fd) plus the pool sub-region so NPUW mmaps
+  //     the pool in place -- zero weight copies. Constant identity travels on
+  //     each Constant's buffer descriptor (ov::weight_sharing), published at
+  //     compile time, so no Context crosses the boundary.
+  //   * GPU (gpu_shared): weights are Parameters imported plainly, then bound
+  //     to views into a shared USM-host buffer below.
+  //   * Non-shared: import the payload directly.
   const bool gpu_shared = global_graph.has_value() && device == "GPU";
   ov::CompiledModel compiled_model;
   try {
-    compiled_model = core->import_model(model_stream, device);
+    if (npu_fd_shared) {
+      // dup() the fd: HandleHolder inside load_mmap_object closes what it is
+      // given, and the original fd is owned by the LiteRT model mapping.
+#if defined(_WIN32)
+      return litert::Error(
+          kLiteRtStatusErrorRuntimeFailure,
+          "fd-backed NPU weight sharing is not supported on Windows");
+#else
+      const int model_fd = exec_bytecode_buffer->fd;
+      ov::AnyMap import_properties;
+      import_properties["NPUW_WEIGHTS_HANDLE_PROVIDER"] =
+          ov::FileHandleProvider([model_fd]() -> ov::FileHandle {
+            return ::dup(model_fd);
+          });
+      import_properties["NPUW_WEIGHTS_HANDLE_REGION_OFFSET"] =
+          static_cast<std::size_t>(pool_file_offset);
+      import_properties["NPUW_WEIGHTS_HANDLE_REGION_SIZE"] =
+          static_cast<std::size_t>(pool_region_size);
+      import_properties[ov::enable_weightless.name()] = true;
+      import_properties["NPU_USE_NPUW"] = "YES";
+      compiled_model =
+          core->import_model(model_stream, device, import_properties);
+#endif
+    } else {
+      compiled_model = core->import_model(model_stream, device);
+    }
   } catch (const std::exception& e) {
     return litert::Error(kLiteRtStatusErrorRuntimeFailure, e.what());
   }

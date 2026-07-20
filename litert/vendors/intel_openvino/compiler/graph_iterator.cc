@@ -157,6 +157,20 @@ GraphIteratorDelegate::get_decoder() const {
         LITERT_LOG(LITERT_VERBOSE, "Data is static or constant for op %d",
                    op.Code());
         tensor_meta_info.m_tensor_data = input.Weights().Bytes().data();
+        const int32_t buffer_id = input.Weights().BufferId();
+
+        // Publish weight-sharing identity so the OV TFLite frontend builds
+        // a descriptor-backed Constant that NPUW (ov::weight_sharing) can look
+        // up. LiteRT weights are per-BufferId allocations with no common arena,
+        // so we hand a synthesized (source_id, bin_offset) to the frontend,
+        // which wraps the bytes in an IdentifiedBuffer.
+        if (source_id_ != 0 && buffer_id_to_offset_) {
+          if (auto it = buffer_id_to_offset_->find(buffer_id);
+              it != buffer_id_to_offset_->end()) {
+            tensor_meta_info.m_source_id = source_id_;
+            tensor_meta_info.m_bin_offset = it->second;
+          }
+        }
 
         // Convert signed i2 weights to unsigned u2 for NPU friendliness.
         // XOR flips each sub-byte element's MSB, which is equivalent to

@@ -14,6 +14,7 @@
 
 #include "litert/vendors/intel_openvino/compiler/openvino_compile_context.h"
 
+#include <cstdlib>
 #include <memory>
 #include <string>
 
@@ -157,6 +158,31 @@ OpenVinoCompileContext::OpenVinoCompileContext() {
 
 LiteRtStatus OpenVinoCompileContext::ConfigureForSoc(const char* soc_model) {
   if (device_ == "NPU") {
+    // NPU weight sharing (gated by LITERT_OV_EMBED_WEIGHTS): set the NPUW knobs
+    // that make compile_model dedup shared Constants into the NPUW bank and
+    // export a weightless blob. The weight identity itself travels on each
+    // Constant's buffer descriptor (published by the frontend), so at runtime
+    // NPUW can mmap the pool out of the model file. Default path is unchanged
+    // unless the env var is set.
+    const char* embed_env = std::getenv("LITERT_OV_EMBED_WEIGHTS");
+    if (embed_env != nullptr && embed_env[0] == '1') {
+      auto set_if_unset = [&](const char* key, const char* value) {
+        if (configs_map_.find(key) == configs_map_.end()) {
+          configs_map_[key] = value;
+        }
+      };
+      set_if_unset("NPU_USE_NPUW", "YES");
+      set_if_unset("NPUW_DEVICES", "NPU");
+      set_if_unset("NPUW_WEIGHTS_BANK", "shared");
+      // NPUW_CWAI ("Closures/Weights As Inputs") keeps weight Constants
+      // resolvable from the bank and lets export_model emit weightless blobs.
+      set_if_unset("NPUW_CWAI", "YES");
+      set_if_unset("NPUW_FUNCALL_FOR_ALL", "YES");
+      LITERT_LOG(LITERT_INFO,
+                 "Weight-sharing NPUW config enabled (NPU_USE_NPUW, "
+                 "NPUW_WEIGHTS_BANK=shared, NPUW_CWAI=YES, "
+                 "NPUW_FUNCALL_FOR_ALL=YES)");
+    }
     return litert::openvino::ConfigureCompilationParams(soc_model,
                                                         configs_map_);
   }

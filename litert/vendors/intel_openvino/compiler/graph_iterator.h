@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <unordered_map>
 #include <vector>
 
 #include "openvino/frontend/tensorflow_lite/decoder.hpp"
@@ -95,6 +96,22 @@ class GraphIteratorDelegate
     return nullptr;
   };
 
+  // Attaches a pre-computed BufferId -> pool_offset map. The offset for each
+  // weight seen in get_decoder() is looked up here and written into
+  // TensorMetaInfo::m_bin_offset so the OV TFLite frontend can build a
+  // descriptor-backed Constant. |source_id| is the weight-source id stamped on
+  // every published descriptor (0 disables identity publishing). This is the
+  // NPU weight-sharing path: weights stay Constants and their identity travels
+  // on the buffer descriptor (ov::weight_sharing), so NPUW resolves offsets
+  // from the model alone -- no Constant->Parameter surgery, no Context.
+  void SetSharedContextIdentity(
+      std::shared_ptr<const std::unordered_map<int32_t, std::size_t>>
+          buffer_id_to_offset,
+      std::size_t source_id) {
+    buffer_id_to_offset_ = std::move(buffer_id_to_offset);
+    source_id_ = source_id;
+  }
+
  private:
   const LiteRtCompilerContext* ctx_;
   size_t node_index_ = 0;
@@ -104,6 +121,12 @@ class GraphIteratorDelegate
   // holds a copy of the original packed bytes with the MSB of every 2-bit
   // pair flipped (XOR 0xAA), which shifts signed [-2,1] to unsigned [0,3].
   mutable std::vector<std::vector<uint8_t>> converted_weight_buffers_;
+  // Shared weight-sharing identity, set by the compiler plugin before the
+  // first get_decoder() call. Absent (nullptr / 0) means "no identity
+  // publishing" and the frontend uses its legacy memcpy path.
+  std::shared_ptr<const std::unordered_map<int32_t, std::size_t>>
+      buffer_id_to_offset_;
+  std::size_t source_id_ = 0;
 };
 
 }  // namespace openvino
