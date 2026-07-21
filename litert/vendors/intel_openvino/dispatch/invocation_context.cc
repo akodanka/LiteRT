@@ -59,6 +59,19 @@
 
 namespace {
 
+// A stable-per-load identity for an OVGLOBAL container, used to key the
+// process-singleton buffer-backed host pool (Document 2 §3.2 / R8). Combines
+// the container base pointer and size; within one process a given loaded
+// container keeps a fixed address, so this dedups the pool across partitions
+// and inferences without hashing the (multi-GB) bytes.
+inline uint64_t HashContainerIdentity(const uint8_t* data, size_t size) {
+  const uint64_t a = reinterpret_cast<uint64_t>(data);
+  const uint64_t b = static_cast<uint64_t>(size);
+  uint64_t h = a + 0x9e3779b97f4a7c15ULL;
+  h ^= b + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
+  return h;
+}
+
 // This class is copied from the OpenVINO codebase with minor modifications
 // for Google C++ Style Guide compliance. It wraps a pre-allocated memory
 // buffer to provide a std::streambuf interface, enabling zero-copy stream
@@ -177,6 +190,13 @@ LiteRtDispatchInvocationContextT::Create(
   bool npu_fd_shared = false;
   size_t pool_file_offset = 0;
   size_t pool_region_size = 0;
+  // NPU buffer-backed weightless host region (Document 2, fd == -1).
+  // npu_host_shared gates it; host_region_ptr/size point at the pool in memory,
+  // host_region_keepalive keeps those bytes alive for the compiled model.
+  bool npu_host_shared = false;
+  const void* host_region_ptr = nullptr;
+  size_t host_region_size = 0;
+  std::shared_ptr<void> host_region_keepalive;
   if (litert::openvino::OpenVinoGlobalGraph::HasMagic(container,
                                                       container_size)) {
     // Header-only parse first: cheap, copies no pool/payload bytes. This is
@@ -210,11 +230,15 @@ LiteRtDispatchInvocationContextT::Create(
     const std::string selected_device_str =
         litert::openvino::GraphBackendToString(*selected_device);
 
+    // Weight-sharing consumption strategy (design §6). Every NPU branch
+    // converges on the SAME NPUW weightless import + descriptor-first identity;
+    // they differ only in how the pool bytes reach OpenVINO. Log the chosen
+    // branch so a silent copy is never mistaken for zero-copy.
     if (selected_device_str == "NPU" && exec_bytecode_buffer->fd >= 0) {
-      // Zero-copy NPU path: stream the payload in place (no copy) and mmap the
-      // pool region out of the fd at import. The pool's absolute offset in the
-      // file is the blob's base in the file + the bytecode start relative to
-      // that base + the pool's start within the container.
+      // [BEST] Doc 1: mmap the pool sub-region out of the fd (zero copies).
+      // The pool's absolute offset in the file is the blob's base in the file
+      // + the bytecode start relative to that base + the pool's start within
+      // the container.
       npu_fd_shared = true;
       pool_file_offset = exec_bytecode_buffer->alloc_base_file_offset +
                          exec_bytecode_buffer->offset + header.pool_data_offset;
@@ -225,17 +249,49 @@ LiteRtDispatchInvocationContextT::Create(
                  "GlobalGraph(NPU,fd): pool_file_offset=%zu pool_size=%zu "
                  "(fd=%d)",
                  pool_file_offset, pool_region_size, exec_bytecode_buffer->fd);
-    } else {
-      // GPU or NPU-without-fd: full Parse copies the pool for the USM bind path.
-      if (selected_device_str == "NPU") {
-        // fd absent: fd-backed sharing is unavailable. Buffer-backed sharing is
-        // a separate design (Document 2); log rather than silently disable.
-        LITERT_LOG(LITERT_WARNING,
-                   "GlobalGraph(NPU): model is not fd-backed (fd=%d); "
-                   "fd-backed zero-copy weight sharing is unavailable for this "
-                   "load. See design_weight_sharing_2_buffer_backed.md.",
-                   exec_bytecode_buffer->fd);
+    } else if (selected_device_str == "NPU") {
+      // Doc 2: fd == -1. The pool is already resident in the caller's model
+      // buffer at container + pool_data_offset. Feed NPUW that host region so
+      // weight sharing stays enabled (dedup, single container, descriptor
+      // identity) -- only the zero-copy mmap is unavailable.
+      npu_host_shared = true;
+      const uint8_t* pool_host_ptr = container + header.pool_data_offset;
+      const size_t pool_size = header.pool_size;
+      exec_bytecode_ptr = container + selected->payload_offset;
+      exec_bytecode_size = selected->payload_size;
+
+      // A stable identity for this container, so the per-process host pool is
+      // materialized once and reused across partitions/inferences (R8).
+      const uint64_t container_id = HashContainerIdentity(container, container_size);
+
+      if (std::getenv("LITERT_OV_WS_HOST_REGION_NONOWNING") != nullptr) {
+        // [B1] Zero-copy: point NPUW straight at the caller's buffer. Only safe
+        // when the buffer outlives the compiled model; the keep-alive here is a
+        // non-owning alias, so this is opt-in.
+        host_region_ptr = pool_host_ptr;
+        host_region_size = pool_size;
+        host_region_keepalive = std::shared_ptr<void>(
+            const_cast<void*>(static_cast<const void*>(container)),
+            [](void*) {});  // non-owning: caller owns the model buffer
+        LITERT_LOG(LITERT_INFO,
+                   "GlobalGraph(NPU,buffer,B1): non-owning host region "
+                   "ptr=%p size=%zu (zero-copy; caller must keep buffer alive)",
+                   pool_host_ptr, pool_size);
+      } else {
+        // [B2, safe default] One owned copy of the pool into a process
+        // singleton keyed by container_id; reused by every partition.
+        auto pool = litert::openvino::GetOrMakeSharedHostPool(
+            container_id, pool_host_ptr, pool_size);
+        host_region_ptr = pool->data();
+        host_region_size = pool->size();
+        host_region_keepalive = pool;  // owns the bytes -> lifetime guaranteed
+        LITERT_LOG(LITERT_INFO,
+                   "GlobalGraph(NPU,buffer,B2): owned shared host pool "
+                   "ptr=%p size=%zu (one copy, fd unavailable)",
+                   host_region_ptr, host_region_size);
       }
+    } else {
+      // GPU: full Parse copies the pool for the USM bind path (unchanged).
       LITERT_ASSIGN_OR_RETURN(global_graph,
                               litert::openvino::OpenVinoGlobalGraph::Parse(
                                   container, container_size));
@@ -338,6 +394,9 @@ LiteRtDispatchInvocationContextT::Create(
   //     the pool in place -- zero weight copies. Constant identity travels on
   //     each Constant's buffer descriptor (ov::weight_sharing), published at
   //     compile time, so no Context crosses the boundary.
+  //   * NPU + buffer (npu_host_shared, fd == -1): import weightless and hand
+  //     NPUW an already-resident host region (Document 2). Same descriptor
+  //     identity/dedup contract; only the weight source differs.
   //   * GPU (gpu_shared): weights are Parameters imported plainly, then bound
   //     to views into a shared USM-host buffer below.
   //   * Non-shared: import the payload directly.
@@ -367,6 +426,26 @@ LiteRtDispatchInvocationContextT::Create(
       compiled_model =
           core->import_model(model_stream, device, import_properties);
 #endif
+    } else if (npu_host_shared) {
+      // Buffer-backed (fd == -1): hand NPUW the host region (ptr/size) and a
+      // keep-alive so it wraps the pool as MappedMemory and reads weights
+      // straight from host memory. Same weightless import + descriptor-first
+      // identity as the fd path; only the weight source differs.
+      ov::AnyMap import_properties;
+      import_properties["NPUW_WEIGHTS_HOST_REGION_PTR"] =
+          reinterpret_cast<std::uintptr_t>(host_region_ptr);
+      import_properties["NPUW_WEIGHTS_HOST_REGION_SIZE"] =
+          static_cast<std::size_t>(host_region_size);
+      import_properties["NPUW_WEIGHTS_HOST_REGION_KEEPALIVE"] =
+          host_region_keepalive;
+      import_properties[ov::enable_weightless.name()] = true;
+      import_properties["NPU_USE_NPUW"] = "YES";
+      compiled_model =
+          core->import_model(model_stream, device, import_properties);
+      LITERT_LOG(LITERT_INFO,
+                 "GlobalGraph(NPU,buffer): weightless import complete "
+                 "(host region ptr=%p size=%zu)",
+                 host_region_ptr, host_region_size);
     } else {
       compiled_model = core->import_model(model_stream, device);
     }

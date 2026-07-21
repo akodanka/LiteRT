@@ -19,6 +19,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -44,6 +45,17 @@ litert::Expected<std::vector<BoundWeight>> BindSharedWeightsGpu(
     ov::Core& core, const OpenVinoGlobalGraph& global_graph,
     const ov::CompiledModel& compiled_model,
     const std::map<uint32_t, uint32_t>& const_map);
+
+// Buffer-backed NPU weight sharing (Document 2, B2). Materializes the weights
+// pool as ONE owned host copy per process, keyed by |container_id| (a stable
+// identity for the OVGLOBAL container). |pool_src|/|pool_size| point at the
+// contiguous pool inside the caller's model buffer; the copy is made once on
+// first call and reused by every partition/inference, mirroring the GPU USM
+// singleton. Returns a shared_ptr whose data() is the pool base -- pass its
+// get()/size() to NPUW as the host region and the shared_ptr itself as the
+// keep-alive (it owns the bytes, so lifetime is guaranteed).
+std::shared_ptr<std::vector<uint8_t>> GetOrMakeSharedHostPool(
+    uint64_t container_id, const uint8_t* pool_src, size_t pool_size);
 
 }  // namespace litert::openvino
 

@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -53,7 +54,46 @@ GpuBank& SharedGpuBank() ABSL_EXCLUSIVE_LOCKS_REQUIRED(GpuBankMutex()) {
   return *bank;
 }
 
+// Buffer-backed NPU host pool: one owned copy of the pool per process, keyed by
+// container identity. Reused across partitions/inferences so the pool is
+// materialized at most once (R8), mirroring SharedGpuBank but for host memory.
+struct HostPoolBank {
+  std::map<uint64_t, std::shared_ptr<std::vector<uint8_t>>> pools;
+};
+absl::Mutex& HostPoolMutex() {
+  static absl::Mutex* mu = new absl::Mutex();
+  return *mu;
+}
+HostPoolBank& SharedHostPoolBank() ABSL_EXCLUSIVE_LOCKS_REQUIRED(HostPoolMutex()) {
+  static HostPoolBank* bank = new HostPoolBank();
+  return *bank;
+}
+
 }  // namespace
+
+std::shared_ptr<std::vector<uint8_t>> GetOrMakeSharedHostPool(
+    uint64_t container_id, const uint8_t* pool_src, size_t pool_size) {
+  absl::MutexLock lock(&HostPoolMutex());
+  HostPoolBank& bank = SharedHostPoolBank();
+  auto it = bank.pools.find(container_id);
+  if (it != bank.pools.end()) {
+    LITERT_LOG(LITERT_INFO,
+               "GlobalGraph(NPU,buffer): reusing shared host pool for "
+               "container 0x%llx (%zu bytes)",
+               static_cast<unsigned long long>(container_id), pool_size);
+    return it->second;
+  }
+  auto pool = std::make_shared<std::vector<uint8_t>>(pool_size);
+  if (pool_size > 0) {
+    std::memcpy(pool->data(), pool_src, pool_size);
+  }
+  bank.pools.emplace(container_id, pool);
+  LITERT_LOG(LITERT_INFO,
+             "GlobalGraph(NPU,buffer): materialized shared host pool for "
+             "container 0x%llx (%zu bytes, one copy)",
+             static_cast<unsigned long long>(container_id), pool_size);
+  return pool;
+}
 
 litert::Expected<std::vector<BoundWeight>> BindSharedWeightsGpu(
     ov::Core& core, const OpenVinoGlobalGraph& global_graph,
