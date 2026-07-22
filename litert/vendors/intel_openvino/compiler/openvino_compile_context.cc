@@ -193,7 +193,11 @@ LiteRtStatus OpenVinoCompileContext::ConfigureForSoc(const char* soc_model) {
 void OpenVinoCompileContext::OptimizeModel(
     const std::shared_ptr<ov::Model>& model) const {
   if (device_ == "NPU") {
+    // Same LITERT_OV_EMBED_WEIGHTS=1 gate as the NPUW compile knobs.
+    const char* embed_env = std::getenv("LITERT_OV_EMBED_WEIGHTS");
+    const bool share_weights = embed_env != nullptr && embed_env[0] == '1';
     NpuOptimizer()
+        .SetConstantFold(share_weights)
         .SetEliminateMatMulFakeQuantize(eliminate_fq_after_matmul_)
         .SetFuseSplitAttentionToSDPA(fuse_split_attention_to_sdpa_)
         .SetSdpaPadKvToAlignment(sdpa_pad_kv_to_alignment_)
