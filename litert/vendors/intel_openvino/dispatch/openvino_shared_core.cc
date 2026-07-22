@@ -14,6 +14,12 @@
 
 #include "litert/vendors/intel_openvino//dispatch/openvino_shared_core.h"
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#include <unistd.h>
+#endif
+
+#include <cstddef>
 #include <exception>
 #include <memory>
 #include <mutex>  // NOLINT
@@ -21,11 +27,19 @@
 #include <vector>
 
 #include "openvino/runtime/core.hpp"
+#include "litert/c/internal/litert_logging.h"
 
 OpenVINOSharedCore::OpenVINOSharedCore()
     : core_(std::make_shared<ov::Core>()) {}
 
-OpenVINOSharedCore::~OpenVINOSharedCore() = default;
+OpenVINOSharedCore::~OpenVINOSharedCore() {
+#if defined(__linux__)
+  if (bank_memfd_ >= 0) {
+    ::close(bank_memfd_);
+    bank_memfd_ = -1;
+  }
+#endif
+}
 
 // static
 OpenVINOSharedCore* OpenVINOSharedCore::GetInstance() {
@@ -42,4 +56,49 @@ const std::vector<std::string>& OpenVINOSharedCore::GetAvailableDevices() {
     }
   });
   return available_devices_;
+}
+
+int OpenVINOSharedCore::EnsureBankMemfd(const void* data, size_t size) {
+#if defined(__linux__)
+  std::lock_guard<std::mutex> lock(bank_mu_);
+  if (bank_memfd_ >= 0) {
+    return bank_memfd_;
+  }
+  // Anonymous, close-on-exec in-memory file (Linux >= 3.17). Backed by tmpfs:
+  // no disk I/O, no filename races, no cleanup-on-crash concern.
+  int fd = ::memfd_create("litert_ov_bank", MFD_CLOEXEC);
+  if (fd < 0) {
+    LITERT_LOG(LITERT_ERROR, "EnsureBankMemfd: memfd_create failed");
+    return -1;
+  }
+  // Size must be >= pool_size or NPUW's set_from_fd throws "Requested mapping
+  // range exceeds file size".
+  if (::ftruncate(fd, static_cast<off_t>(size)) != 0) {
+    LITERT_LOG(LITERT_ERROR, "EnsureBankMemfd: ftruncate(%zu) failed", size);
+    ::close(fd);
+    return -1;
+  }
+  // Write the whole pool at offset 0 so the memfd base == pool start; then
+  // NPUW's whole-fd map resolves each Constant as data() + bin_offset.
+  const char* src = static_cast<const char*>(data);
+  for (size_t off = 0; off < size;) {
+    ssize_t n = ::pwrite(fd, src + off, size - off, static_cast<off_t>(off));
+    if (n <= 0) {
+      LITERT_LOG(LITERT_ERROR, "EnsureBankMemfd: pwrite failed at offset %zu",
+                 off);
+      ::close(fd);
+      return -1;
+    }
+    off += static_cast<size_t>(n);
+  }
+  bank_memfd_ = fd;  // owned; closed in dtor. Callers dup() per use.
+  LITERT_LOG(LITERT_INFO, "EnsureBankMemfd: staged %zu bytes into memfd", size);
+  return bank_memfd_;
+#else
+  (void)data;
+  (void)size;
+  LITERT_LOG(LITERT_ERROR,
+             "EnsureBankMemfd: memfd weight bank is only supported on Linux");
+  return -1;
+#endif
 }

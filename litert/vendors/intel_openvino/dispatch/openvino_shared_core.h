@@ -15,6 +15,7 @@
 #ifndef ODML_LITERT_LITERT_VENDORS_OPENVINO_DISPATCH_OPENVINO_SHARED_CORE_H_
 #define ODML_LITERT_LITERT_VENDORS_OPENVINO_DISPATCH_OPENVINO_SHARED_CORE_H_
 
+#include <cstddef>
 #include <memory>
 #include <mutex>  // NOLINT
 #include <optional>
@@ -63,6 +64,19 @@ class OpenVINOSharedCore {
   // underlying query throws.
   const std::vector<std::string>& GetAvailableDevices();
 
+  // NPU weight sharing: stage the deduplicated weight pool into an anonymous
+  // in-memory file (memfd) once per process and return its fd. The pool bytes
+  // are written at offset 0 so a whole-fd mmap by NPUW yields base == pool
+  // start, and each Constant resolves as `mapped->data() + bin_offset`.
+  //
+  // The returned fd is OWNED by this singleton (closed in the dtor); callers
+  // must NOT close it. NPUW invokes the handle provider more than once and
+  // close()s whatever it receives, so the provider must hand out a fresh
+  // dup(fd) on every call -- never this fd directly. Cached after the first
+  // successful call (subsequent calls ignore |data|/|size| and return the
+  // same fd). Returns -1 on failure (e.g. memfd_create/ftruncate/pwrite).
+  int EnsureBankMemfd(const void* data, size_t size);
+
  private:
   OpenVINOSharedCore();
   ~OpenVINOSharedCore();
@@ -75,6 +89,11 @@ class OpenVINOSharedCore {
       ABSL_GUARDED_BY(state_mutex_);
   std::once_flag available_devices_once_;
   std::vector<std::string> available_devices_;
+
+  // Anonymous in-memory weight bank (memfd), lazily created by
+  // EnsureBankMemfd and owned for the process lifetime. Guarded by bank_mu_.
+  std::mutex bank_mu_;
+  int bank_memfd_ = -1;
 };
 
 #endif  // ODML_LITERT_LITERT_VENDORS_OPENVINO_DISPATCH_OPENVINO_SHARED_CORE_H_

@@ -15,6 +15,7 @@
 #include "litert/vendors/intel_openvino/compiler/global_graph.h"
 
 #include <cstdint>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -79,6 +80,36 @@ TEST(GlobalGraphTest, RoundTrip) {
     EXPECT_EQ(out_subgraph.device, in_subgraph.device);
     EXPECT_EQ(out_subgraph.payload, in_subgraph.payload);
     EXPECT_EQ(out_subgraph.const_map, in_subgraph.const_map);
+  }
+}
+
+// ParseHeader locates the contiguous pool and each subgraph payload as views
+// (no pool copy), and every buffer resolves as pool + pool_offset ==
+// Parse().buffers.
+TEST(GlobalGraphTest, ParseHeaderViewsPoolAndPayloads) {
+  const OpenVinoGlobalGraph in = MakeSample();
+  const std::string blob = in.Serialize();
+  const auto* base = reinterpret_cast<const uint8_t*>(blob.data());
+
+  auto hdr = OpenVinoGlobalGraph::ParseHeader(base, blob.size());
+  ASSERT_TRUE(hdr.HasValue());
+  const auto& h = hdr.Value();
+
+  // Pool span points inside the blob and matches BankBytes.
+  EXPECT_EQ(h.pool_size, in.BankBytes());
+  EXPECT_EQ(h.pool, base + h.pool_data_offset);
+  EXPECT_LE(h.pool_data_offset + h.pool_size, blob.size());
+
+  // Payloads are views that reproduce the originals (embedded NULs included).
+  ASSERT_EQ(h.subgraphs.size(), in.subgraphs.size());
+  for (const auto& [name, in_subgraph] : in.subgraphs) {
+    ASSERT_TRUE(h.subgraphs.count(name));
+    const auto& v = h.subgraphs.at(name);
+    EXPECT_EQ(v.device, in_subgraph.device);
+    EXPECT_EQ(v.const_map, in_subgraph.const_map);
+    ASSERT_EQ(v.payload_size, in_subgraph.payload.size());
+    EXPECT_EQ(0, std::memcmp(v.payload, in_subgraph.payload.data(),
+                             v.payload_size));
   }
 }
 

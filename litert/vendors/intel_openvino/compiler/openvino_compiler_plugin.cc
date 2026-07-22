@@ -13,10 +13,12 @@
 // limitations under the License.
 
 #include <cstddef>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <ios>
 #include <limits>
+#include <map>
 #include <memory>
 #include <ostream>
 #include <streambuf>
@@ -29,8 +31,10 @@
 #include "openvino/core/except.hpp"
 #include "openvino/frontend/tensorflow_lite/frontend.hpp"
 #include "openvino/frontend/tensorflow_lite/graph_iterator.hpp"
+#include "openvino/op/constant.hpp"
 #include "openvino/openvino.hpp"
 #include "openvino/runtime/core.hpp"
+#include "litert/vendors/intel_openvino/compiler/weightless_caching_attributes.hpp"
 #include "absl/strings/str_format.h"  // from @com_google_absl
 #include "litert/c/internal/litert_logging.h"
 #include "litert/c/internal/litert_logging_helper_with_compiler_context.h"
@@ -522,6 +526,13 @@ LiteRtStatus LiteRtCompilerPluginCompile(
     // subgraph's weights against the shared pool.
     litert::openvino::WeightBank weight_bank;
     litert::openvino::OpenVinoGlobalGraph global_graph;
+    // Authoritative BufferId -> byte offset in the serialized pool. Built once
+    // below by walking the pool in the SAME ascending-BufferId order that
+    // OpenVinoGlobalGraph::Serialize() writes it, so a Constant's stamped WLCA
+    // bin_offset (NPU path) is exactly its byte position in the pool NPUW maps.
+    // This shared map is the correctness linchpin between §4 tagging and §5
+    // serialization.
+    std::map<uint32_t, uint64_t> pool_offset_of;
     const char* embed_env = std::getenv("LITERT_OV_EMBED_WEIGHTS");
     const bool share_weights = embed_env != nullptr && embed_env[0] == '1';
     if (share_weights) {
@@ -537,6 +548,13 @@ LiteRtStatus LiteRtCompilerPluginCompile(
             static_cast<uint32_t>(buffer_id),
             std::string(reinterpret_cast<const char*>(bytes.data()),
                         bytes.size()));
+      }
+      // Walk the pool in ascending BufferId order (std::map is sorted) to fix
+      // each buffer's pool offset, matching Serialize()'s layout exactly.
+      uint64_t running_offset = 0;
+      for (const auto& [buffer_id, bytes] : global_graph.buffers) {
+        pool_offset_of[buffer_id] = running_offset;
+        running_offset += bytes.size();
       }
     }
 
@@ -569,23 +587,69 @@ LiteRtStatus LiteRtCompilerPluginCompile(
         ov::AnyMap configs = context.ConfigsMap();
         std::map<uint32_t, uint32_t> const_map;
         if (share_weights) {
-          // Weight sharing is currently GPU-only. Other devices (NPU/CPU) are a
-          // later patchset; fail loudly rather than emit an unshared model.
-          if (context.Device() != "GPU") {
+          // Two consumption strategies over one OVGLOBAL container:
+          //   GPU -> Constant->Parameter + const_map, bound to a USM host pool
+          //          at dispatch (unchanged).
+          //   NPU -> weights stay Constants tagged with
+          //          WeightlessCacheAttribute(bin_offset); NPUW's CWAI export
+          //          emits a weightless blob and the dispatch-time memfd
+          //          handle-provider resolves data()+bin_offset. const_map
+          //          stays empty on this path.
+          if (context.Device() == "GPU") {
+            // Convert weights to Parameters bound to the shared bank at
+            // dispatch; const_map records input_index -> BufferId.
+            const size_t converted =
+                litert::openvino::ConvertWeightsToParameters(
+                    ov_model, weight_bank, &const_map);
+            LITERT_LOG(LITERT_INFO,
+                       "Weight sharing: converted %zu weights to parameters "
+                       "in partition %d",
+                       converted, partition_idx);
+          } else if (context.Device() == "NPU") {
+            // Tag every large Constant with WeightlessCacheAttribute whose
+            // bin_offset is the buffer's position in the shared pool (from the
+            // authoritative pool_offset_of map). Constants sharing a BufferId
+            // across partitions resolve to the same bin_offset, so
+            // cross-partition dedup collapses to one NPUW bank entry.
+            size_t tagged = 0;
+            for (const auto& node : ov_model->get_ordered_ops()) {
+              auto cnst = ov::as_type_ptr<ov::op::v0::Constant>(node);
+              if (!cnst) continue;
+              const auto elem_size = cnst->get_element_type().size();
+              // Skip tiny/shape/scalar constants (LiteRT_linux's < 16 element
+              // threshold) -- not worth sharing and often OV-synthesized.
+              if (elem_size == 0) continue;
+              if (cnst->get_byte_size() / elem_size < 16) continue;
+              auto& rt = cnst->get_rt_info();
+              if (rt.find(
+                      ov::WeightlessCacheAttribute::get_type_info_static()) !=
+                  rt.end()) {
+                continue;
+              }
+              // Constants synthesized by OV passes have no LiteRt source buffer
+              // and can't be shared -- leave them baked.
+              auto bid = weight_bank.BufferIdOfName(cnst->get_friendly_name());
+              if (!bid) continue;
+              auto off_it = pool_offset_of.find(static_cast<uint32_t>(*bid));
+              if (off_it == pool_offset_of.end()) continue;
+              rt[ov::WeightlessCacheAttribute::get_type_info_static()] =
+                  ov::WeightlessCacheAttribute(
+                      cnst->get_byte_size(),
+                      static_cast<size_t>(off_it->second),
+                      cnst->get_element_type());
+              ++tagged;
+            }
+            LITERT_LOG(LITERT_INFO,
+                       "Weight sharing: tagged %zu Constants with WLCA in "
+                       "partition %d",
+                       tagged, partition_idx);
+          } else {
             LITERT_LOG(LITERT_ERROR,
-                       "Weight sharing is only supported on GPU (partition %d "
-                       "targets '%s')",
+                       "Weight sharing is only supported on GPU/NPU (partition "
+                       "%d targets '%s')",
                        partition_idx, context.Device().c_str());
             return kLiteRtStatusErrorUnsupported;
           }
-          // Convert weights to Parameters bound to the shared bank at dispatch;
-          // const_map records input_index -> BufferId.
-          const size_t converted = litert::openvino::ConvertWeightsToParameters(
-              ov_model, weight_bank, &const_map);
-          LITERT_LOG(LITERT_INFO,
-                     "Weight sharing: converted %zu weights to parameters "
-                     "in partition %d",
-                     converted, partition_idx);
         }
 
         // Compile using the per-partition device and properties.

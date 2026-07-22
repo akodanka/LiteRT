@@ -14,6 +14,7 @@
 
 #include "litert/vendors/intel_openvino/compiler/openvino_compile_context.h"
 
+#include <cstdlib>
 #include <memory>
 #include <string>
 
@@ -157,6 +158,32 @@ OpenVinoCompileContext::OpenVinoCompileContext() {
 
 LiteRtStatus OpenVinoCompileContext::ConfigureForSoc(const char* soc_model) {
   if (device_ == "NPU") {
+    // NPU weight sharing (gated on the same LITERT_OV_EMBED_WEIGHTS=1 env the
+    // compiler plugin uses to build the shared OVGLOBAL container): turn on the
+    // NPUW + weightless-cache knobs so export_model emits a *weightless* blob
+    // whose Constant records carry the bin_offset we stamp via
+    // WeightlessCacheAttribute. Without these the export bakes weights and the
+    // dispatch-time memfd handle provider has nothing to resolve against. The
+    // default (non-shared) path is untouched.
+    const char* embed_env = std::getenv("LITERT_OV_EMBED_WEIGHTS");
+    if (embed_env != nullptr && embed_env[0] == '1') {
+      auto set_if_unset = [&](const char* key, const char* value) {
+        if (configs_map_.find(key) == configs_map_.end()) {
+          configs_map_[key] = value;
+        }
+      };
+      set_if_unset("NPU_USE_NPUW", "YES");
+      set_if_unset("NPUW_DEVICES", "NPU");
+      set_if_unset("NPUW_WEIGHTS_BANK", "shared");
+      // NPUW_CWAI ("Closures/Weights As Inputs") is what makes export_model
+      // emit a weightless blob keyed by our stamped bin_offsets.
+      set_if_unset("NPUW_CWAI", "YES");
+      set_if_unset("NPUW_FUNCALL_FOR_ALL", "YES");
+      LITERT_LOG(LITERT_INFO,
+                 "Weight-sharing NPUW config enabled (NPU_USE_NPUW, "
+                 "NPUW_DEVICES=NPU, NPUW_WEIGHTS_BANK=shared, NPUW_CWAI=YES, "
+                 "NPUW_FUNCALL_FOR_ALL=YES)");
+    }
     return litert::openvino::ConfigureCompilationParams(soc_model,
                                                         configs_map_);
   }
