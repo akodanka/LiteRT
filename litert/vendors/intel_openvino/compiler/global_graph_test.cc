@@ -82,6 +82,66 @@ TEST(GlobalGraphTest, RoundTrip) {
   }
 }
 
+// ParseHeader locates the contiguous pool and each subgraph payload zero-copy,
+// aliasing the input blob. The pool bytes it points at must equal the buffers
+// laid out in ascending BufferId order (this is what the NPU temp file copies,
+// and what the WeightlessCacheAttribute bin_offset resolves against).
+TEST(GlobalGraphTest, ParseHeaderLocatesPoolAndPayloads) {
+  const OpenVinoGlobalGraph in = MakeSample();
+  const std::string blob = in.Serialize();
+  const auto* base = reinterpret_cast<const uint8_t*>(blob.data());
+
+  auto parsed = OpenVinoGlobalGraph::ParseHeader(base, blob.size());
+  ASSERT_TRUE(parsed.HasValue());
+  const OpenVinoGlobalGraph::Header& hdr = parsed.Value();
+
+  // Pool span is in-bounds and equals the sum of the buffers.
+  EXPECT_EQ(hdr.pool_size, in.BankBytes());
+  EXPECT_EQ(hdr.pool.size, in.BankBytes());
+  ASSERT_EQ(hdr.pool.data, base + hdr.pool_data_offset);
+  EXPECT_GE(hdr.pool_data_offset, 8u + 2u);  // after magic + version
+  EXPECT_LE(hdr.pool_data_offset + hdr.pool_size, blob.size());
+
+  // The contiguous pool is buffers laid out in ascending BufferId order, so a
+  // buffer's byte offset == the running sum of all lower-id buffers' sizes.
+  size_t offset = 0;
+  for (const auto& [id, bytes] : in.buffers) {  // std::map: ascending id
+    ASSERT_LE(offset + bytes.size(), hdr.pool_size);
+    const std::string got(reinterpret_cast<const char*>(hdr.pool.data + offset),
+                          bytes.size());
+    EXPECT_EQ(got, bytes) << "buffer id=" << id;
+    offset += bytes.size();
+  }
+
+  // Subgraph payloads are aliased in place and match the originals.
+  ASSERT_EQ(hdr.subgraphs.size(), in.subgraphs.size());
+  for (const auto& [name, in_sg] : in.subgraphs) {
+    ASSERT_TRUE(hdr.subgraphs.count(name));
+    const auto& view = hdr.subgraphs.at(name);
+    EXPECT_EQ(view.device, in_sg.device);
+    EXPECT_EQ(view.const_map, in_sg.const_map);
+    const std::string payload(reinterpret_cast<const char*>(view.payload.data),
+                              view.payload.size);
+    EXPECT_EQ(payload, in_sg.payload);
+  }
+}
+
+// ParseHeader rejects bad magic / truncated blobs rather than over-reading.
+TEST(GlobalGraphTest, ParseHeaderRejectsBadInput) {
+  const std::string junk = "not-an-ovglobal-container-blob";
+  EXPECT_FALSE(OpenVinoGlobalGraph::ParseHeader(
+                   reinterpret_cast<const uint8_t*>(junk.data()), junk.size())
+                   .HasValue());
+
+  const std::string blob = MakeSample().Serialize();
+  for (size_t cut : {blob.size() / 2, blob.size() - 1}) {
+    EXPECT_FALSE(OpenVinoGlobalGraph::ParseHeader(
+                     reinterpret_cast<const uint8_t*>(blob.data()), cut)
+                     .HasValue())
+        << "cut=" << cut;
+  }
+}
+
 // BankBytes sums the deduplicated buffer pool.
 TEST(GlobalGraphTest, BankBytesSumsPool) {
   const OpenVinoGlobalGraph graph = MakeSample();

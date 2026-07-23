@@ -32,6 +32,7 @@
 
 #include "openvino/core/any.hpp"
 #include "openvino/runtime/compiled_model.hpp"
+#include "openvino/runtime/core.hpp"
 #include "openvino/runtime/properties.hpp"
 #include "openvino/runtime/tensor.hpp"
 #include "litert/c/internal/litert_logging.h"
@@ -147,39 +148,52 @@ LiteRtDispatchInvocationContextT::Create(
   auto exec_bytecode_size = exec_bytecode_buffer->size;
 
   // GlobalGraph weight sharing: the compiler returns ONE container blob for all
-  // partitions (magic "OVGLOBAL") holding a shared buffer pool + per-subgraph
-  // {payload, const_map, device}. Parse it and select THIS partition's subgraph
-  // (by function_name, which the plugin sets to the graph name; fall back to the
-  // sole/first subgraph). The subgraph's weights are resolved against the pool at
-  // import below. Non-shared models skip this and use the raw bytecode directly.
-  std::optional<litert::openvino::OpenVinoGlobalGraph> global_graph;
+  // partitions (magic "OVGLOBAL") holding a contiguous shared buffer pool +
+  // per-subgraph {payload, const_map, device}. We parse it ZERO-COPY with
+  // ParseHeader (the pool can be multi-GB; only the small weightless payload is
+  // copied out) and select THIS partition's subgraph (by function_name, which
+  // the plugin sets to the graph name; fall back to the sole subgraph). The
+  // subgraph's weights are resolved against the pool at import below:
+  //   - GPU: bound as views into a shared USM-host copy of the pool.
+  //   - NPU: the pool is staged to a temp file and handed to NPUW via
+  //     ov::weights_path; each Constant's WeightlessCacheAttribute bin_offset
+  //     resolves to mmap->data() + bin_offset.
+  // Non-shared models skip this and use the raw bytecode directly.
+  bool has_container = false;
   std::map<std::string, uint32_t> selected_const_map;
   std::optional<LiteRtIntelOpenVinoGraphBackend> selected_device;
   std::vector<uint8_t> selected_payload;
+  // Zero-copy view of the contiguous weight pool (aliases exec_bytecode_buffer,
+  // which outlives this function). Used by the NPU arm to stage the pool.
+  const uint8_t* pool_ptr = nullptr;
+  size_t pool_size = 0;
   if (litert::openvino::OpenVinoGlobalGraph::HasMagic(
           static_cast<const uint8_t*>(exec_bytecode_ptr), exec_bytecode_size)) {
+    has_container = true;
     LITERT_ASSIGN_OR_RETURN(
-        global_graph, litert::openvino::OpenVinoGlobalGraph::Parse(
-                          static_cast<const uint8_t*>(exec_bytecode_ptr),
-                          exec_bytecode_size));
+        litert::openvino::OpenVinoGlobalGraph::Header header,
+        litert::openvino::OpenVinoGlobalGraph::ParseHeader(
+            static_cast<const uint8_t*>(exec_bytecode_ptr), exec_bytecode_size));
+    pool_ptr = header.pool.data;
+    pool_size = header.pool.size;
 
-
-    const litert::openvino::OpenVinoGlobalGraph::Subgraph* selected = nullptr;
+    const litert::openvino::OpenVinoGlobalGraph::Header::SubgraphView* selected =
+        nullptr;
     if (function_name != nullptr && function_name[0] != '\0') {
-      auto it = global_graph->subgraphs.find(function_name);
-      if (it != global_graph->subgraphs.end()) selected = &it->second;
+      auto it = header.subgraphs.find(function_name);
+      if (it != header.subgraphs.end()) selected = &it->second;
     }
-    if (selected == nullptr && !global_graph->subgraphs.empty()) {
+    if (selected == nullptr && !header.subgraphs.empty()) {
       // Only fall back to the sole subgraph; with multiple partitions a
       // missing/mismatched function_name is ambiguous, so fail rather than
       // silently load the wrong partition's payload.
-      if (global_graph->subgraphs.size() == 1) {
+      if (header.subgraphs.size() == 1) {
         LITERT_LOG(LITERT_WARNING,
                    "GlobalGraph: function_name '%s' not found, falling back "
                    "to sole subgraph '%s'",
                    function_name ? function_name : "(null)",
-                   global_graph->subgraphs.begin()->first.c_str());
-        selected = &global_graph->subgraphs.begin()->second;
+                   header.subgraphs.begin()->first.c_str());
+        selected = &header.subgraphs.begin()->second;
       } else {
         return litert::Error(kLiteRtStatusErrorRuntimeFailure,
                              "GlobalGraph: function_name not found and "
@@ -191,15 +205,17 @@ LiteRtDispatchInvocationContextT::Create(
                            "GlobalGraph: no subgraph for function_name");
     }
     LITERT_LOG(LITERT_INFO,
-               "GlobalGraph: selected subgraph '%s' (%zu byte payload) for "
+               "GlobalGraph: selected subgraph (%zu byte payload) for "
                "function_name '%s'",
-               selected->name.c_str(), selected->payload.size(),
-               function_name ? function_name : "(null)");
+               selected->payload.size, function_name ? function_name : "(null)");
     selected_const_map = selected->const_map;
     selected_device =
         static_cast<LiteRtIntelOpenVinoGraphBackend>(selected->device);
-    // Copy the selected payload into an owned buffer; we import from it below.
-    selected_payload.assign(selected->payload.begin(), selected->payload.end());
+    // Copy the selected (weightless-on-NPU / Parameters-on-GPU) payload into an
+    // owned buffer; we import from it below. This is small -- the large pool is
+    // NOT copied here.
+    selected_payload.assign(selected->payload.data,
+                            selected->payload.data + selected->payload.size);
     exec_bytecode_ptr = selected_payload.data();
     exec_bytecode_size = selected_payload.size();
   }
@@ -284,15 +300,47 @@ LiteRtDispatchInvocationContextT::Create(
                          "Failed to open model bytecode stream");
   }
 
-  // Resolve a GlobalGraph subgraph's weights against the shared pool: on GPU the
-  // weights are Parameters imported plainly, then bound to views into a shared
-  // usm-host buffer (below). A non-shared model (no container) imports its
-  // payload directly. Weight sharing is GPU-only; non-GPU shared models are
-  // rejected at compile time (a later patchset adds the NPU arm).
-  const bool gpu_shared = global_graph.has_value() && device == "GPU";
+  // Resolve a GlobalGraph subgraph's weights against the shared pool. Two
+  // consumption strategies over one container format:
+  //   - GPU: weights are Parameters imported plainly, then bound to views into
+  //     a shared usm-host buffer (below).
+  //   - NPU: weights are Constants tagged with WeightlessCacheAttribute; the
+  //     pool is staged to a temp file and imported via ov::weights_path so NPUW
+  //     mmaps it and resolves each constant as mmap->data() + bin_offset.
+  // A non-shared model (no container) imports its payload directly.
+  const bool gpu_shared = has_container && device == "GPU";
+  const bool npu_shared = has_container && device == "NPU";
+
   ov::CompiledModel compiled_model;
   try {
-    compiled_model = core->import_model(model_stream, device);
+    if (npu_shared) {
+      // Stage the deduplicated pool to a temp file once per process, then hand
+      // it to NPUW. The temp file is a byte-for-byte copy of the contiguous
+      // pool span, starting at byte 0, so bin_offset resolves directly.
+      const std::string bank_path =
+          OpenVINOSharedCore::GetInstance()->EnsureBankOnDisk(pool_ptr,
+                                                              pool_size);
+      if (bank_path.empty()) {
+        return litert::Error(
+            kLiteRtStatusErrorRuntimeFailure,
+            "Failed to stage shared weights bank to a temp file");
+      }
+      ov::AnyMap import_properties;
+      // NPU_USE_NPUW is required or the plain NPU plugin rejects the NPUW blob;
+      // WEIGHTS_PATH + ENABLE_WEIGHTLESS are required or NPUW asserts "Blob is
+      // weightless but no WEIGHTS_PATH nor MODEL_PTR property is provided!".
+      import_properties["NPU_USE_NPUW"] = std::string("YES");
+      import_properties[ov::weights_path.name()] = bank_path;
+      import_properties[ov::enable_weightless.name()] = true;
+      LITERT_LOG(LITERT_INFO,
+                 "GlobalGraph: importing weightless NPU blob with "
+                 "WEIGHTS_PATH='%s' (%zu byte pool)",
+                 bank_path.c_str(), pool_size);
+      compiled_model = core->import_model(model_stream, device,
+                                          import_properties);
+    } else {
+      compiled_model = core->import_model(model_stream, device);
+    }
   } catch (const std::exception& e) {
     return litert::Error(kLiteRtStatusErrorRuntimeFailure, e.what());
   }
@@ -300,12 +348,21 @@ LiteRtDispatchInvocationContextT::Create(
   auto infer_request = compiled_model.create_infer_request();
 
   // Bind the shared weights onto the infer request and hold the views for its
-  // lifetime (set_input_tensor does not take ownership).
+  // lifetime (set_input_tensor does not take ownership). GPU only: NPU weights
+  // are resolved inside NPUW from the mmapped temp file, so nothing to bind.
   std::vector<ov::Tensor> bound_weights;
   if (gpu_shared) {
+    // The GPU bank needs the pool keyed by buffer_id, so do a full Parse here
+    // (materializes the pool). This path is unchanged from before.
+    LITERT_ASSIGN_OR_RETURN(
+        litert::openvino::OpenVinoGlobalGraph global_graph,
+        litert::openvino::OpenVinoGlobalGraph::Parse(
+            static_cast<const uint8_t*>(exec_bytecode_buffer->base_addr) +
+                exec_bytecode_buffer->offset,
+            exec_bytecode_buffer->size));
     LITERT_ASSIGN_OR_RETURN(
         std::vector<litert::openvino::BoundWeight> bound,
-        device_context.GpuBank().Bind(*core, *global_graph, compiled_model,
+        device_context.GpuBank().Bind(*core, global_graph, compiled_model,
                                       selected_const_map));
     bound_weights.reserve(bound.size());
     for (auto& b : bound) {

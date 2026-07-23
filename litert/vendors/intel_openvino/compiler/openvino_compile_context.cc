@@ -163,6 +163,22 @@ LiteRtStatus OpenVinoCompileContext::ConfigureForSoc(const char* soc_model) {
   return kLiteRtStatusOk;
 }
 
+void OpenVinoCompileContext::ConfigureForNpuWeightSharing() {
+  if (device_ != "NPU") return;
+  // Route through NPUW and make CWAI (Closures/Weights-As-Inputs) emit a
+  // weightless blob whose constant records carry the bin_offset we stamp via
+  // WeightlessCacheAttribute. These are string-valued NPUW private properties;
+  // set by literal key because npuw_private_properties.hpp is not shipped in
+  // the runtime SDK.
+  configs_map_["NPU_USE_NPUW"] = "YES";
+  configs_map_["NPUW_DEVICES"] = "NPU";
+  configs_map_["NPUW_WEIGHTS_BANK"] = "shared";
+  configs_map_["NPUW_CWAI"] = "YES";
+  configs_map_["NPUW_FUNCALL_FOR_ALL"] = "YES";
+  LITERT_LOG(LITERT_INFO,
+             "NPU weight sharing: enabled NPUW/CWAI weightless compile knobs");
+}
+
 void OpenVinoCompileContext::OptimizeModel(
     const std::shared_ptr<ov::Model>& model) const {
   if (device_ == "NPU") {
