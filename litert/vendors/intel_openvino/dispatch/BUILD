@@ -64,6 +64,17 @@ litert_dynamic_lib(
     ] + select({
         "//litert:android": ["-Wl,-lc++abi"],
         "//conditions:default": [],
+    }) + select({
+        # Keep libstdc++ template instantiations (e.g. std::filesystem::path)
+        # LOCAL to this .so and bind our own references internally, so a path
+        # object we construct is never destroyed by a differently-built
+        # module's interposed weak-symbol copy (OpenVINO libs on the loader
+        # path). GNU-ld / lld only; MSVC has no equivalent and doesn't need it.
+        "//litert:windows": [],
+        "//conditions:default": [
+            "-Wl,--exclude-libs,ALL",
+            "-Wl,-Bsymbolic",
+        ],
     }),
     shared_lib_name = "dispatch_api_so",
     so_name = "libLiteRtDispatch_IntelOpenvino.so",
@@ -128,7 +139,15 @@ litert_bin(
         "//conditions:default": [],
     }),
     features = ["-use_header_modules"],  # Incompatible with -fexceptions.
-    linkopts = litert_android_linkopts(),
+    linkopts = litert_android_linkopts() + select({
+        # See dispatch_api_so above: keep libstdc++ instantiations local so a
+        # std::filesystem::path is never destroyed by another module's copy.
+        "//litert:windows": [],
+        "//conditions:default": [
+            "-Wl,--exclude-libs,ALL",
+            "-Wl,-Bsymbolic",
+        ],
+    }),
     linkshared = 1,
     visibility = ["//visibility:public"],  # Allows LiteRT-LM packaging.
     deps = [

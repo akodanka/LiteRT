@@ -51,8 +51,8 @@ OpenVINOSharedCore::~OpenVINOSharedCore() {
 
 // static
 OpenVINOSharedCore* OpenVINOSharedCore::GetInstance() {
-  static OpenVINOSharedCore* instance = new OpenVINOSharedCore();
-  return instance;
+  static OpenVINOSharedCore instance;
+  return &instance;
 }
 
 const std::vector<std::string>& OpenVINOSharedCore::GetAvailableDevices() {
@@ -76,6 +76,16 @@ std::string OpenVINOSharedCore::EnsureBankOnDisk(const void* data,
   std::lock_guard<std::mutex> lock(bank_mu_);
   if (!bank_path_.empty()) return bank_path_;  // write once, reuse
 
+  // Guard against a null/empty pool: writing 0 bytes yields an empty file that
+  // NPUW would mmap to a zero-length region, so data()+bin_offset is undefined.
+  if (data == nullptr || size == 0) {
+    LITERT_LOG(LITERT_ERROR,
+               "EnsureBankOnDisk: refusing to stage null/empty pool "
+               "(data=%p size=%zu)",
+               data, size);
+    return {};
+  }
+
   // Deployment override: point at a pre-staged bank and skip the write.
   if (const char* override_path = std::getenv("LITERT_OV_WEIGHTS_PATH");
       override_path != nullptr && override_path[0] != '\0') {
@@ -98,7 +108,7 @@ std::string OpenVINOSharedCore::EnsureBankOnDisk(const void* data,
 
   // std::filesystem has no mkstemp equivalent; probe random names in the system
   // temp dir. std::random_device + exists() is portable across Windows / Linux
-  // / Android (unlike mkstemp/unistd.h, which is POSIX-only).
+  // / Android (unlike mkstemp, which is POSIX-only).
   std::random_device rd;
   std::filesystem::path file_path;
   bool found = false;
@@ -127,10 +137,8 @@ std::string OpenVINOSharedCore::EnsureBankOnDisk(const void* data,
                file_path.string().c_str());
     return {};
   }
-  if (size > 0) {
-    out.write(static_cast<const char*>(data),
-              static_cast<std::streamsize>(size));
-  }
+  out.write(static_cast<const char*>(data),
+            static_cast<std::streamsize>(size));
   out.close();
   if (!out) {
     LITERT_LOG(LITERT_ERROR,

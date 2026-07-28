@@ -79,6 +79,11 @@ class OpenVINOSharedCore {
   // (std::filesystem + ofstream, no POSIX-only APIs). The file is unlinked in
   // the destructor. Honors the LITERT_OV_WEIGHTS_PATH override to point at a
   // pre-staged bank and skip the write.
+  //
+  // NOTE: safe use of std::filesystem::path here depends on the dispatch .so
+  // being linked with -Wl,--exclude-libs,ALL -Wl,-Bsymbolic (see its BUILD
+  // target), which keeps libstdc++'s weak path symbols local to this module so
+  // a path is never destroyed by a differently-built module's interposed copy.
   std::string EnsureBankOnDisk(const void* data, size_t size);
 
   // Returns the cached bank path, or empty if EnsureBankOnDisk has not yet
