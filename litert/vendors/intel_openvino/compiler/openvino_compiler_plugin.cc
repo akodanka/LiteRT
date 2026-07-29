@@ -660,7 +660,10 @@ LiteRtStatus LiteRtCompilerPluginCompile(
     // standalone baked-weights bytecode. Determining this up front (rather than
     // per-partition inside the loop) keeps the container all-or-nothing, so we
     // never emit a half-shared model. |share_device| records the common target.
-    bool share_weights = num_partitions > 0;
+    //
+    // Require > 1 partition: this deduplicates weights ACROSS partitions, so a
+    // lone partition gains nothing.
+    bool share_weights = num_partitions > 1;
     std::string share_device;
     for (int p = 0; p < num_partitions && share_weights; ++p) {
       LITERT_ASSIGN_OR_RETURN(
