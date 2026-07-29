@@ -28,6 +28,7 @@
 
 #include "openvino/core/any.hpp"
 #include "openvino/core/except.hpp"
+#include "openvino/core/graph_util.hpp"
 #include "openvino/core/type/element_type.hpp"
 #include "openvino/frontend/tensorflow_lite/frontend.hpp"
 #include "openvino/frontend/tensorflow_lite/graph_iterator.hpp"
@@ -245,20 +246,41 @@ class CustomOStreamBuf : public std::streambuf {
   size_t pos_;
 };
 
-// Tags each large weight Constant in |ov_model| with a WeightlessCacheAttribute
-// carrying its byte position (|pool_offset_of[BufferId]|) in the deduplicated
-// weight pool. NPUW's weightless import reads this back (get_constant_origin)
-// and resolves the constant as mapped_weights->data() + bin_offset. No
-// Constant->Parameter surgery happens on NPU: weights stay Constants.
+// Rebuilds each large bank-backed weight Constant in |ov_model| so its data
+// pointer ALIASES the deduplicated pool bytes for its BufferId (a stable host
+// pointer that is identical across every partition), then stamps its
+// WeightlessCacheAttribute(bin_offset).
 //
-// Returns the number of Constants tagged. Constants with no BufferId (created
-// by OV passes, not backed by a LiteRt buffer) can't be shared and are skipped
-// (they stay baked). The element-count threshold skips shape/scalar constants.
-size_t TagConstantsWithWlca(
+// Aliasing is the load-bearing step for NPU weight sharing. NPUW dedups weights
+// inside a bank by ov::npuw::weights::op::Const equality, which is keyed on the
+// Constant's data pointer (get_data_ptr()), NOT on bin_offset. The stock TFLite
+// frontend materializes each weight with a COPYING constructor
+// (Constant::create), so the same shared BufferId lands at a DIFFERENT address
+// in each independently-compiled partition -> different LazyTensor hash -> NPUW
+// registers a separate bank entry and allocates a second NPU copy (no sharing).
+// Pointing every partition's Constant at the one pool buffer makes the hashes
+// match so NPUW collapses them to a single allocation. bin_offset is still
+// required: it tells NPUW where in the runtime temp file to mmap the weight
+// during Const::eval(). See debug_npu_weight_sharing_not_shared.md.
+//
+// A Constant is aliased ONLY when its current bytes are byte-identical to the
+// pool bytes for its BufferId. A mismatch means a content-altering frontend
+// transform rewrote this weight (e.g. the i2->u2 remap in graph_iterator.cc):
+// the pool still holds the original bytes, so aliasing would feed the graph the
+// wrong data. Such weights are left baked/per-partition (correct, just not
+// shared). Comparing bytes is the robust guard -- no need to enumerate which
+// transforms alter content.
+//
+// Returns the number of Constants aliased (i.e. actually shareable). Constants
+// with no BufferId (synthesized by OV passes) or below the element threshold
+// stay baked.
+size_t AliasAndTagSharedConstants(
     const std::shared_ptr<ov::Model>& ov_model,
     const litert::openvino::WeightBank& weight_bank,
-    const std::map<int32_t, size_t>& pool_offset_of) {
-  size_t tagged = 0;
+    const std::map<int32_t, size_t>& pool_offset_of, int partition_idx) {
+  // Collect before mutating: replacing nodes while iterating get_ordered_ops()
+  // is unsafe.
+  std::vector<std::shared_ptr<ov::op::v0::Constant>> candidates;
   for (const auto& node : ov_model->get_ordered_ops()) {
     auto cnst = ov::as_type_ptr<ov::op::v0::Constant>(node);
     if (!cnst) continue;
@@ -266,20 +288,87 @@ size_t TagConstantsWithWlca(
     // Skip tiny/shape/scalar constants (fewer than 16 elements) and any type
     // with unknown element size.
     if (elem_size == 0 || cnst->get_byte_size() / elem_size < 16) continue;
-    auto& rt = cnst->get_rt_info();
-    if (rt.count(ov::WeightlessCacheAttribute::get_type_info_static())) {
-      continue;  // already tagged
-    }
+    candidates.push_back(cnst);
+  }
+
+  const auto& buffers = weight_bank.Buffers();
+  size_t aliased = 0;
+  size_t tagged = 0;
+  size_t mismatched = 0;
+  bool logged_exemplar = false;
+  for (const auto& cnst : candidates) {
     const auto bid = weight_bank.BufferIdOfName(cnst->get_friendly_name());
     if (!bid) continue;  // OV-synthesized const: not backed by a shared buffer
     const auto off_it = pool_offset_of.find(*bid);
     if (off_it == pool_offset_of.end()) continue;  // not in the shared pool
-    rt[ov::WeightlessCacheAttribute::get_type_info_static()] =
-        ov::WeightlessCacheAttribute(cnst->get_byte_size(), off_it->second,
-                                     cnst->get_element_type());
-    ++tagged;
+    const auto buf_it = buffers.find(*bid);
+    if (buf_it == buffers.end()) continue;  // defensive: id present in map only
+    const absl::Span<const uint8_t> pool_bytes = buf_it->second;
+
+    const void* frontend_ptr = cnst->get_data_ptr();
+    const size_t cnst_bytes = cnst->get_byte_size();
+
+    // Alias only if the Constant's bytes match the pool bytes (see header
+    // comment). Compare size first, then contents.
+    const bool bytes_match =
+        cnst_bytes == pool_bytes.size() &&
+        std::memcmp(frontend_ptr, pool_bytes.data(), cnst_bytes) == 0;
+
+    std::shared_ptr<ov::op::v0::Constant> tag_target = cnst;
+    if (bytes_match) {
+      // Non-owning Constant over the shared pool bytes (no copy). The pool span
+      // is a view into the ONE LiteRt weight mmap; it is identical across every
+      // partition and outlives this compile (the model buffer lives for the
+      // whole LiteRtCompilerPluginCompile call, and this partition's
+      // compile_model + export_model run inside it), so a null keep-alive is
+      // safe. After this, get_data_ptr() returns the pool pointer, so every
+      // partition's Constant for this BufferId shares one address -> NPUW
+      // dedups.
+      auto aliased_cnst = std::make_shared<ov::op::v0::Constant>(
+          cnst->get_element_type(), cnst->get_shape(), pool_bytes.data(),
+          std::shared_ptr<void>{});
+      aliased_cnst->set_friendly_name(cnst->get_friendly_name());
+      aliased_cnst->get_output_tensor(0).set_names(
+          cnst->get_output_tensor(0).get_names());
+      ov::replace_node(cnst, aliased_cnst);
+      tag_target = std::move(aliased_cnst);
+      ++aliased;
+    } else {
+      ++mismatched;
+    }
+
+    // Stamp the WLCA (bin_offset) on whichever Constant now lives in the graph.
+    auto& rt = tag_target->get_rt_info();
+    if (!rt.count(ov::WeightlessCacheAttribute::get_type_info_static())) {
+      rt[ov::WeightlessCacheAttribute::get_type_info_static()] =
+          ov::WeightlessCacheAttribute(tag_target->get_byte_size(),
+                                       off_it->second,
+                                       tag_target->get_element_type());
+      ++tagged;
+    }
+
+    // Confirmation log (once per partition, first shareable weight). The SAME
+    // BufferId should show a DIFFERENT frontend_ptr in each partition (the bug)
+    // but the SAME pool_ptr after aliasing (the fix): that is how we verify the
+    // dedup identity is now stable across partitions.
+    // See debug_npu_weight_sharing_not_shared.md sec 4.
+    if (!logged_exemplar && bytes_match) {
+      LITERT_LOG(LITERT_INFO,
+                 "Weight sharing (NPU) p%d exemplar: bid=%d frontend_ptr=%p -> "
+                 "pool_ptr=%p (bin_offset=%zu, %zu bytes)",
+                 partition_idx, *bid, frontend_ptr,
+                 static_cast<const void*>(pool_bytes.data()), off_it->second,
+                 cnst_bytes);
+      logged_exemplar = true;
+    }
   }
-  return tagged;
+
+  LITERT_LOG(LITERT_INFO,
+             "Weight sharing (NPU) p%d: aliased %zu constants to the shared "
+             "pool, tagged %zu with WeightlessCacheAttribute, left %zu unshared "
+             "(bytes differ from pool -- content-altered, e.g. i2->u2)",
+             partition_idx, aliased, tagged, mismatched);
+  return aliased;
 }
 
 }  // namespace
@@ -657,17 +746,16 @@ LiteRtStatus LiteRtCompilerPluginCompile(
         std::map<std::string, uint32_t> const_map;
         if (share_weights) {
           if (share_npu) {
-            // NPU: tag weight Constants with WeightlessCacheAttribute
-            // (bin_offset from the authoritative pool map). No Constant->
-            // Parameter surgery -- weights stay Constants -- so const_map stays
-            // empty; the dispatcher resolves weights via the temp-file
-            // weights_path at import.
-            const size_t tagged =
-                TagConstantsWithWlca(ov_model, weight_bank, pool_offset_of);
-            LITERT_LOG(LITERT_INFO,
-                       "Weight sharing (NPU): tagged %zu weight constants "
-                       "with WeightlessCacheAttribute in partition %d",
-                       tagged, partition_idx);
+            // NPU: alias each weight Constant onto the shared pool bytes (so the
+            // same BufferId has one host pointer across all partitions -- the
+            // dedup identity NPUW keys on) and tag it with
+            // WeightlessCacheAttribute (bin_offset from the authoritative pool
+            // map, used to mmap the runtime temp file). No Constant->Parameter
+            // surgery -- weights stay Constants -- so const_map stays empty; the
+            // dispatcher resolves weights via the temp-file weights_path at
+            // import. See debug_npu_weight_sharing_not_shared.md.
+            AliasAndTagSharedConstants(ov_model, weight_bank, pool_offset_of,
+                                       partition_idx);
           } else {
             // GPU: convert weights to Parameters bound to the shared bank at
             // dispatch; const_map records friendly_name -> BufferId.
