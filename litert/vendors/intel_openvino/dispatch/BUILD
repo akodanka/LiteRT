@@ -70,9 +70,13 @@ litert_dynamic_lib(
         # object we construct is never destroyed by a differently-built
         # module's interposed weak-symbol copy (OpenVINO libs on the loader
         # path). GNU-ld / lld only; MSVC has no equivalent and doesn't need it.
+        # NOTE: do NOT add -Wl,--exclude-libs,ALL here. This target links its
+        # srcs via an intermediate static archive, so --exclude-libs would
+        # force LiteRtDispatchGetApi hidden (overriding the export_litert_only
+        # version script) and break dispatch loading. The version script's
+        # "local: *" already hides libstdc++/absl from export.
         "//litert:windows": [],
         "//conditions:default": [
-            "-Wl,--exclude-libs,ALL",
             "-Wl,-Bsymbolic",
         ],
     }),
