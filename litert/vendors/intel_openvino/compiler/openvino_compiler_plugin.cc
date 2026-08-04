@@ -17,6 +17,7 @@
 #include <cstring>
 #include <ios>
 #include <limits>
+#include <map>
 #include <memory>
 #include <ostream>
 #include <streambuf>
@@ -24,15 +25,18 @@
 #include <string_view>
 #include <utility>
 #include <vector>
-#include <map>
 
 #include "openvino/core/any.hpp"
 #include "openvino/core/except.hpp"
+#include "openvino/core/graph_util.hpp"
+#include "openvino/core/type/element_type.hpp"
 #include "openvino/frontend/tensorflow_lite/frontend.hpp"
 #include "openvino/frontend/tensorflow_lite/graph_iterator.hpp"
+#include "openvino/op/constant.hpp"
 #include "openvino/openvino.hpp"
 #include "openvino/runtime/core.hpp"
 #include "absl/strings/str_format.h"  // from @com_google_absl
+#include "absl/types/span.h"  // from @com_google_absl
 #include "litert/c/internal/litert_logging.h"
 #include "litert/c/internal/litert_logging_helper_with_compiler_context.h"
 #include "litert/c/litert_common.h"
@@ -55,6 +59,7 @@
 #include "litert/vendors/intel_openvino/compiler/openvino_compile_context.h"
 #include "litert/vendors/intel_openvino/compiler/openvino_soc_config.h"
 #include "litert/vendors/intel_openvino/compiler/weight_bank.h"
+#include "litert/vendors/intel_openvino/compiler/weightless_caching_attributes.hpp"
 #include "litert/vendors/intel_openvino/compiler/weights_to_parameters.h"
 
 namespace {
@@ -240,6 +245,132 @@ class CustomOStreamBuf : public std::streambuf {
   std::string target_;
   size_t pos_;
 };
+
+// Rebuilds each large bank-backed weight Constant in |ov_model| so its data
+// pointer ALIASES the deduplicated pool bytes for its BufferId (a stable host
+// pointer that is identical across every partition), then stamps its
+// WeightlessCacheAttribute(bin_offset).
+//
+// Aliasing is the load-bearing step for NPU weight sharing. NPUW dedups weights
+// inside a bank by ov::npuw::weights::op::Const equality, which is keyed on the
+// Constant's data pointer (get_data_ptr()), NOT on bin_offset. The stock TFLite
+// frontend materializes each weight with a COPYING constructor
+// (Constant::create), so the same shared BufferId lands at a DIFFERENT address
+// in each independently-compiled partition -> different LazyTensor hash -> NPUW
+// registers a separate bank entry and allocates a second NPU copy (no sharing).
+// Pointing every partition's Constant at the one pool buffer makes the hashes
+// match so NPUW collapses them to a single allocation. bin_offset is still
+// required: it tells NPUW where in the runtime temp file to mmap the weight
+// during Const::eval(). See debug_npu_weight_sharing_not_shared.md.
+//
+// A Constant is aliased ONLY when its current bytes are byte-identical to the
+// pool bytes for its BufferId. A mismatch means a content-altering frontend
+// transform rewrote this weight (e.g. the i2->u2 remap in graph_iterator.cc):
+// the pool still holds the original bytes, so aliasing would feed the graph the
+// wrong data. Such weights are left baked/per-partition (correct, just not
+// shared). Comparing bytes is the robust guard -- no need to enumerate which
+// transforms alter content.
+//
+// Returns the number of Constants aliased (i.e. actually shareable). Constants
+// with no BufferId (synthesized by OV passes) or below the element threshold
+// stay baked.
+size_t AliasAndTagSharedConstants(
+    const std::shared_ptr<ov::Model>& ov_model,
+    const litert::openvino::WeightBank& weight_bank,
+    const std::map<int32_t, size_t>& pool_offset_of, int partition_idx) {
+  // Collect before mutating: replacing nodes while iterating get_ordered_ops()
+  // is unsafe.
+  std::vector<std::shared_ptr<ov::op::v0::Constant>> candidates;
+  for (const auto& node : ov_model->get_ordered_ops()) {
+    auto cnst = ov::as_type_ptr<ov::op::v0::Constant>(node);
+    if (!cnst) continue;
+    const size_t elem_size = cnst->get_element_type().size();
+    // Skip tiny/shape/scalar constants (fewer than 16 elements) and any type
+    // with unknown element size.
+    if (elem_size == 0 || cnst->get_byte_size() / elem_size < 16) continue;
+    candidates.push_back(cnst);
+  }
+
+  const auto& buffers = weight_bank.Buffers();
+  size_t aliased = 0;
+  size_t tagged = 0;
+  size_t mismatched = 0;
+  bool logged_exemplar = false;
+  for (const auto& cnst : candidates) {
+    const auto bid = weight_bank.BufferIdOfName(cnst->get_friendly_name());
+    if (!bid) continue;  // OV-synthesized const: not backed by a shared buffer
+    const auto off_it = pool_offset_of.find(*bid);
+    if (off_it == pool_offset_of.end()) continue;  // not in the shared pool
+    const auto buf_it = buffers.find(*bid);
+    if (buf_it == buffers.end()) continue;  // defensive: id present in map only
+    const absl::Span<const uint8_t> pool_bytes = buf_it->second;
+
+    const void* frontend_ptr = cnst->get_data_ptr();
+    const size_t cnst_bytes = cnst->get_byte_size();
+
+    // Alias only if the Constant's bytes match the pool bytes (see header
+    // comment). Compare size first, then contents.
+    const bool bytes_match =
+        cnst_bytes == pool_bytes.size() &&
+        std::memcmp(frontend_ptr, pool_bytes.data(), cnst_bytes) == 0;
+
+    std::shared_ptr<ov::op::v0::Constant> tag_target = cnst;
+    if (bytes_match) {
+      // Non-owning Constant over the shared pool bytes (no copy). The pool span
+      // is a view into the ONE LiteRt weight mmap; it is identical across every
+      // partition and outlives this compile (the model buffer lives for the
+      // whole LiteRtCompilerPluginCompile call, and this partition's
+      // compile_model + export_model run inside it), so a null keep-alive is
+      // safe. After this, get_data_ptr() returns the pool pointer, so every
+      // partition's Constant for this BufferId shares one address -> NPUW
+      // dedups.
+      auto aliased_cnst = std::make_shared<ov::op::v0::Constant>(
+          cnst->get_element_type(), cnst->get_shape(), pool_bytes.data(),
+          std::shared_ptr<void>{});
+      aliased_cnst->set_friendly_name(cnst->get_friendly_name());
+      aliased_cnst->get_output_tensor(0).set_names(
+          cnst->get_output_tensor(0).get_names());
+      ov::replace_node(cnst, aliased_cnst);
+      tag_target = std::move(aliased_cnst);
+      ++aliased;
+    } else {
+      ++mismatched;
+    }
+
+    // Stamp the WLCA (bin_offset) on whichever Constant now lives in the graph.
+    auto& rt = tag_target->get_rt_info();
+    if (!rt.count(ov::WeightlessCacheAttribute::get_type_info_static())) {
+      rt[ov::WeightlessCacheAttribute::get_type_info_static()] =
+          ov::WeightlessCacheAttribute(tag_target->get_byte_size(),
+                                       off_it->second,
+                                       tag_target->get_element_type());
+      ++tagged;
+    }
+
+    // Confirmation log (once per partition, first shareable weight). The SAME
+    // BufferId should show a DIFFERENT frontend_ptr in each partition (the bug)
+    // but the SAME pool_ptr after aliasing (the fix): that is how we verify the
+    // dedup identity is now stable across partitions.
+    // See debug_npu_weight_sharing_not_shared.md sec 4.
+    if (!logged_exemplar && bytes_match) {
+      LITERT_LOG(LITERT_INFO,
+                 "Weight sharing (NPU) p%d exemplar: bid=%d frontend_ptr=%p -> "
+                 "pool_ptr=%p (bin_offset=%zu, %zu bytes)",
+                 partition_idx, *bid, frontend_ptr,
+                 static_cast<const void*>(pool_bytes.data()), off_it->second,
+                 cnst_bytes);
+      logged_exemplar = true;
+    }
+  }
+
+  LITERT_LOG(LITERT_INFO,
+             "Weight sharing (NPU) p%d: aliased %zu constants to the shared "
+             "pool, tagged %zu with WeightlessCacheAttribute, left %zu unshared "
+             "(bytes differ from pool -- content-altered, e.g. i2->u2)",
+             partition_idx, aliased, tagged, mismatched);
+  return aliased;
+}
+
 }  // namespace
 
 LiteRtStatus LiteRtGetCompilerPluginVersion(LiteRtApiVersion* api_version) {
@@ -523,36 +654,64 @@ LiteRtStatus LiteRtCompilerPluginCompile(
     // selects its subgraph and resolves the subgraph's weights against the
     // shared pool.
     //
-    // Enabled automatically when EVERY partition targets GPU (the only backend
-    // that supports the weights-as-Parameters + shared-USM dispatch path). A
-    // model with any non-GPU partition falls back to standalone baked-weights
-    // bytecode. Determining this up front (rather than per-partition inside the
-    // loop) keeps the container all-or-nothing, so we never emit a half-shared
-    // model.
-    bool share_weights = num_partitions > 0;
+    // Enabled automatically when EVERY partition targets the SAME shareable
+    // backend -- either all GPU (weights-as-Parameters + shared-USM dispatch)
+    // or all NPU (WeightlessCacheAttribute + temp-file weights_path dispatch;
+    // see design_weight_sharing_WLCA_weights_path.md). A model that mixes
+    // devices, or targets a non-shareable backend (CPU), falls back to
+    // standalone baked-weights bytecode. Determining this up front (rather than
+    // per-partition inside the loop) keeps the container all-or-nothing, so we
+    // never emit a half-shared model. |share_device| records the common target.
+    //
+    // Require > 1 partition: this deduplicates weights ACROSS partitions, so a
+    // lone partition gains nothing.
+    bool share_weights = num_partitions > 1;
+    std::string share_device;
     for (int p = 0; p < num_partitions && share_weights; ++p) {
       LITERT_ASSIGN_OR_RETURN(
           litert::openvino::OpenVinoCompileContext probe,
           litert::openvino::OpenVinoCompileContext::Create(
               compiler_plugin->GetIntelOpenVinoOptions(), p));
-      if (probe.Device() != "GPU") share_weights = false;
+      const std::string& dev = probe.Device();
+      if (dev != "GPU" && dev != "NPU") {
+        share_weights = false;  // only GPU and NPU support shared dispatch
+      } else if (share_device.empty()) {
+        share_device = dev;  // first partition sets the required common device
+      } else if (dev != share_device) {
+        share_weights = false;  // heterogeneous devices: don't half-share
+      }
     }
+    const bool share_npu = share_weights && share_device == "NPU";
 
     litert::openvino::WeightBank weight_bank;
     litert::openvino::OpenVinoGlobalGraph global_graph;
+    // Authoritative BufferId -> byte offset in the serialized (contiguous) pool.
+    // Built once, in ascending BufferId order -- the SAME order Serialize()
+    // lays out the pool -- so a Constant's WeightlessCacheAttribute bin_offset
+    // (§4) equals its byte position in the temp file staged at dispatch (§6).
+    // This is the correctness linchpin for the NPU weightless path.
+    std::map<int32_t, size_t> pool_offset_of;
     if (share_weights) {
       for (int p = 0; p < num_partitions; ++p) {
         auto subgraph = model.Subgraph(p);
         if (subgraph.HasValue()) weight_bank.AddSubgraph(subgraph.Value());
       }
-      LITERT_LOG(LITERT_INFO, "Weight sharing (GPU): %zu buffers, %zu bytes",
-                 weight_bank.NumBuffers(), weight_bank.TotalBytes());
-      // Populate the GlobalGraph shared buffer pool (BufferId -> bytes).
-      for (const auto& [buffer_id, bytes] : weight_bank.Buffers()) {
+      LITERT_LOG(LITERT_INFO, "Weight sharing (%s): %zu buffers, %zu bytes",
+                 share_device.c_str(), weight_bank.NumBuffers(),
+                 weight_bank.TotalBytes());
+      // Populate the GlobalGraph shared buffer pool (BufferId -> bytes). Use an
+      // ordered map keyed by BufferId so the pool is laid out in ascending id
+      // order (matching Serialize()), then assign each buffer its pool offset.
+      std::map<uint32_t, absl::Span<const uint8_t>> ordered(
+          weight_bank.Buffers().begin(), weight_bank.Buffers().end());
+      size_t running_offset = 0;
+      for (const auto& [buffer_id, bytes] : ordered) {
         global_graph.buffers.emplace(
-            static_cast<uint32_t>(buffer_id),
+            buffer_id,
             std::string(reinterpret_cast<const char*>(bytes.data()),
                         bytes.size()));
+        pool_offset_of[static_cast<int32_t>(buffer_id)] = running_offset;
+        running_offset += bytes.size();
       }
     }
 
@@ -566,6 +725,12 @@ LiteRtStatus LiteRtCompilerPluginCompile(
           litert::openvino::OpenVinoCompileContext::Create(
               compiler_plugin->GetIntelOpenVinoOptions(), partition_idx));
       LITERT_RETURN_IF_ERROR(context.ConfigureForSoc(soc_model));
+      if (share_npu) {
+        // NPU shared path: turn on NPUW/CWAI so export_model emits a weightless
+        // blob whose constants are referenced by WeightlessCacheAttribute
+        // bin_offset instead of baked in.
+        context.ConfigureForNpuWeightSharing();
+      }
 
       auto graph_name = absl::StrFormat("Partition_%d", partition_idx);
       litert::Expected<litert::compiler::Subgraph> expected_subgraph =
@@ -586,16 +751,28 @@ LiteRtStatus LiteRtCompilerPluginCompile(
         ov::AnyMap configs = context.ConfigsMap();
         std::map<std::string, uint32_t> const_map;
         if (share_weights) {
-          // share_weights is only set when every partition targets GPU (see the
-          // pre-scan above), so this path is GPU-only by construction.
-          // Convert weights to Parameters bound to the shared bank at dispatch;
-          // const_map records friendly_name -> BufferId.
-          const size_t converted = litert::openvino::ConvertWeightsToParameters(
-              ov_model, weight_bank, &const_map);
-          LITERT_LOG(LITERT_INFO,
-                     "Weight sharing: converted %zu weights to parameters "
-                     "in partition %d",
-                     converted, partition_idx);
+          if (share_npu) {
+            // NPU: alias each weight Constant onto the shared pool bytes (so the
+            // same BufferId has one host pointer across all partitions -- the
+            // dedup identity NPUW keys on) and tag it with
+            // WeightlessCacheAttribute (bin_offset from the authoritative pool
+            // map, used to mmap the runtime temp file). No Constant->Parameter
+            // surgery -- weights stay Constants -- so const_map stays empty; the
+            // dispatcher resolves weights via the temp-file weights_path at
+            // import. See debug_npu_weight_sharing_not_shared.md.
+            AliasAndTagSharedConstants(ov_model, weight_bank, pool_offset_of,
+                                       partition_idx);
+          } else {
+            // GPU: convert weights to Parameters bound to the shared bank at
+            // dispatch; const_map records friendly_name -> BufferId.
+            const size_t converted =
+                litert::openvino::ConvertWeightsToParameters(
+                    ov_model, weight_bank, &const_map);
+            LITERT_LOG(LITERT_INFO,
+                       "Weight sharing (GPU): converted %zu weights to "
+                       "parameters in partition %d",
+                       converted, partition_idx);
+          }
         }
 
         // Compile using the per-partition device and properties.
