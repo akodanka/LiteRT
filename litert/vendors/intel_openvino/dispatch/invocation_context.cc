@@ -311,6 +311,30 @@ LiteRtDispatchInvocationContextT::Create(
   const bool gpu_shared = has_container && device == "GPU";
   const bool npu_shared = has_container && device == "NPU";
 
+  // Cross-check the pool span against the ACTUAL bytecode buffer extent before
+  // staging. ParseHeader validated the pool against exec_bytecode_size, but if
+  // that size overstated the truly-mapped region (e.g. a partially loaded
+  // model) staging would read past the mapping and crash. Fail loudly instead.
+  if (npu_shared) {
+    const uint8_t* buf_base =
+        static_cast<const uint8_t*>(exec_bytecode_buffer->base_addr);
+    const uint8_t* buf_end = buf_base + exec_bytecode_buffer->offset +
+                             exec_bytecode_buffer->size;
+    const uint8_t* pool_end = pool_ptr + pool_size;
+    if (pool_ptr < buf_base || pool_end > buf_end) {
+      LITERT_LOG(LITERT_ERROR,
+                 "Dispatch: pool span [%p,%p) escapes bytecode buffer "
+                 "[%p,%p); refusing to stage (container/model size mismatch)",
+                 static_cast<const void*>(pool_ptr),
+                 static_cast<const void*>(pool_end),
+                 static_cast<const void*>(buf_base),
+                 static_cast<const void*>(buf_end));
+      return litert::Error(
+          kLiteRtStatusErrorRuntimeFailure,
+          "Shared weight pool escapes the bytecode buffer bounds");
+    }
+  }
+
   ov::CompiledModel compiled_model;
   try {
     if (npu_shared) {
