@@ -138,12 +138,31 @@ class LiteRtDispatchDeviceContextT {
   // cannot race on the allocation itself.
   litert::openvino::GpuSharedBank gpu_shared_bank_;
   litert::openvino::NpuSharedBank npu_shared_bank_;
+  // Duplicated descriptor of the file this model was mmapped from, opened once
+  // on the first partition that asks for it (prefill and decode import from the
+  // same file). Null until then, and for models that are not file-backed.
+  mutable absl::Mutex model_file_handle_mutex_;
+  std::shared_ptr<litert::openvino::ModelFileHandle> model_file_handle_
+      ABSL_GUARDED_BY(model_file_handle_mutex_);
 
  public:
   // Bound at dispatch by the invocation context; see GpuSharedBank::Bind and
   // NpuSharedBank::EnsureOnDisk.
   litert::openvino::GpuSharedBank& GpuBank() { return gpu_shared_bank_; }
   litert::openvino::NpuSharedBank& NpuBank() { return npu_shared_bank_; }
+
+  // Duplicates |fd| on the first call and returns the same holder afterwards,
+  // ignoring later |fd|s (every partition of a model carries the same model
+  // file). Returns nullptr if |fd| is negative or the dup failed, which is the
+  // caller's signal to fall back to staging the pool on disk.
+  std::shared_ptr<litert::openvino::ModelFileHandle> EnsureModelFileHandle(
+      int fd) {
+    absl::MutexLock lock(&model_file_handle_mutex_);
+    if (model_file_handle_ == nullptr) {
+      model_file_handle_ = litert::openvino::ModelFileHandle::Create(fd);
+    }
+    return model_file_handle_;
+  }
 };
 
 #endif  // ODML_LITERT_LITERT_VENDORS_OPENVINO_DISPATCH_LITERT_DISPATCH_DEVICE_CONTEXT_H_

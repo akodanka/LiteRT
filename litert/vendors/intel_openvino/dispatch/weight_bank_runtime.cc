@@ -24,6 +24,7 @@
 #include <fstream>
 #include <ios>
 #include <map>
+#include <memory>
 #include <random>
 #include <string>
 #include <system_error>
@@ -40,6 +41,13 @@
 #include "litert/c/litert_common.h"
 #include "litert/cc/litert_expected.h"
 #include "litert/vendors/intel_openvino/compiler/global_graph.h"
+
+// LITERT_WINDOWS_OS comes from litert_common.h above.
+#if defined(LITERT_WINDOWS_OS)
+#include <io.h>  // _dup, _close, _get_osfhandle
+#else
+#include <unistd.h>  // dup, close
+#endif  // defined(LITERT_WINDOWS_OS)
 
 namespace litert::openvino {
 
@@ -211,6 +219,54 @@ std::string NpuSharedBank::EnsureOnDisk(const void* data, size_t size) {
              "NPU weight sharing: staged %zu-byte weights bank to '%s'", size,
              bank_path_.c_str());
   return bank_path_;
+}
+
+std::shared_ptr<ModelFileHandle> ModelFileHandle::Create(int fd) {
+  if (fd < 0) {
+    return nullptr;  // model is not file-backed (in-memory flatbuffer)
+  }
+#if defined(LITERT_WINDOWS_OS)
+  const int dup_fd = _dup(fd);
+#else
+  const int dup_fd = ::dup(fd);
+#endif  // defined(LITERT_WINDOWS_OS)
+  if (dup_fd < 0) {
+    LITERT_LOG(LITERT_WARNING,
+               "NPU weight sharing: failed to duplicate model fd %d", fd);
+    return nullptr;
+  }
+  // Private constructor, so no make_shared.
+  return std::shared_ptr<ModelFileHandle>(new ModelFileHandle(dup_fd));
+}
+
+ModelFileHandle::~ModelFileHandle() {
+  if (fd_ < 0) return;
+#if defined(LITERT_WINDOWS_OS)
+  _close(fd_);
+#else
+  ::close(fd_);
+#endif  // defined(LITERT_WINDOWS_OS)
+}
+
+ov::FileHandle ModelFileHandle::Handle() const {
+#if defined(LITERT_WINDOWS_OS)
+  // Borrowed: the returned HANDLE belongs to fd_, and OpenVINO duplicates it
+  // internally rather than taking it over. See the header for why we must NOT
+  // duplicate here.
+  const intptr_t handle = _get_osfhandle(fd_);
+  return reinterpret_cast<ov::FileHandle>(handle);
+#else
+  // Owned: OpenVINO close()s whatever fd it is given once the mapping dies, so
+  // each call has to yield a descriptor of its own.
+  return ::dup(fd_);
+#endif  // defined(LITERT_WINDOWS_OS)
+}
+
+ov::FileHandleProvider MakeFileHandleProvider(
+    std::shared_ptr<ModelFileHandle> handle) {
+  return [handle = std::move(handle)]() -> ov::FileHandle {
+    return handle->Handle();
+  };
 }
 
 }  // namespace litert::openvino

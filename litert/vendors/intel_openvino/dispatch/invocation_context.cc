@@ -19,11 +19,13 @@
 #include <chrono>  // NOLINT
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <ios>
 #include <istream>
 #include <map>
+#include <memory>
 #include <optional>
 #include <streambuf>
 #include <string>
@@ -133,6 +135,34 @@ class SharedStreamBuffer : public std::streambuf {
   size_t offset_;
 };
 
+// NPUW's fd-backed weights source: a callback returning a handle to the file
+// holding the weights, plus the sub-region of that file to map. Set by name --
+// intel_npu/npuw_private_properties.hpp declares them, but it is a
+// plugin-private header and is not shipped in the OpenVINO SDK (same reason
+// NPU_USE_NPUW below is set by name).
+constexpr char kNpuwWeightsHandleProvider[] = "NPUW_WEIGHTS_HANDLE_PROVIDER";
+constexpr char kNpuwWeightsHandleRegionOffset[] =
+    "NPUW_WEIGHTS_HANDLE_REGION_OFFSET";
+constexpr char kNpuwWeightsHandleRegionSize[] =
+    "NPUW_WEIGHTS_HANDLE_REGION_SIZE";
+
+// True if |name| is set to something other than empty or "0".
+bool EnvFlagSet(const char* name) {
+  const char* value = std::getenv(name);
+  return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+// Kill switch for the fd-backed weights path, so a deployment can fall back to
+// staging a copy of the pool on disk (and so the two can be A/B'd for peak-RAM
+// measurements) without a rebuild. LITERT_OV_WEIGHTS_PATH also disables it:
+// pointing at a pre-staged bank file (see NpuSharedBank::EnsureOnDisk) is a
+// request for the WEIGHTS_PATH path specifically, and would otherwise be
+// silently ignored.
+bool FdBackedWeightsDisabled() {
+  return EnvFlagSet("LITERT_OV_DISABLE_FD_WEIGHTS") ||
+         EnvFlagSet("LITERT_OV_WEIGHTS_PATH");
+}
+
 }  // namespace
 
 litert::Expected<LiteRtDispatchInvocationContextT::Ptr>
@@ -155,9 +185,11 @@ LiteRtDispatchInvocationContextT::Create(
   // the graph name; fall back to the sole subgraph). The subgraph's weights are
   // resolved against the pool at import below:
   //   - GPU: bound as views into a shared USM-host copy of the pool.
-  //   - NPU: the pool is staged to a temp file and handed to NPUW via
-  //     ov::weights_path; each Constant's WeightlessCacheAttribute bin_offset
-  //     resolves to mmap->data() + bin_offset.
+  //   - NPU: NPUW is pointed at the pool bytes and maps them itself -- at the
+  //     model file's own descriptor when the model is file-backed, else at a
+  //     temp-file copy of the pool. Either way the mapped base is the pool start
+  //     and each Constant's weight-origin offset resolves to
+  //     mmap->data() + offset.
   // Non-shared models skip this and use the raw bytecode directly. |global_graph|
   // is kept at function scope (its spans alias exec_bytecode_buffer, which
   // outlives this function) so the GPU bank fill below can reuse it -- no second
@@ -308,17 +340,20 @@ LiteRtDispatchInvocationContextT::Create(
   // consumption strategies over one container format:
   //   - GPU: weights are Parameters imported plainly, then bound to views into
   //     a shared usm-host buffer (below).
-  //   - NPU: weights are Constants tagged with WeightlessCacheAttribute; the
-  //     pool is staged to a temp file and imported via ov::weights_path so NPUW
-  //     mmaps it and resolves each constant as mmap->data() + bin_offset.
+  //   - NPU: weights are Constants carrying a weight-sharing buffer descriptor
+  //     (pool offset); NPUW mmaps the pool itself (from the model file's fd, or
+  //     from a temp-file copy) and resolves each constant as
+  //     mmap->data() + offset.
   // A non-shared model (no container) imports its payload directly.
   const bool gpu_shared = has_container && device == "GPU";
   const bool npu_shared = has_container && device == "NPU";
 
   // Cross-check the pool span against the ACTUAL bytecode buffer extent before
-  // staging. Parse validated the pool against exec_bytecode_size, but if that
+  // using it. Parse validated the pool against exec_bytecode_size, but if that
   // size overstated the truly-mapped region (e.g. a partially loaded model)
-  // staging would read past the mapping and crash. Fail loudly instead.
+  // staging would read past the mapping and crash. Fail loudly instead. This is
+  // also the precondition for the pool's file-offset arithmetic on the fd-backed
+  // path below (pool_ptr >= base_addr, whole span inside the buffer).
   if (npu_shared) {
     const uint8_t* buf_base =
         static_cast<const uint8_t*>(exec_bytecode_buffer->base_addr);
@@ -342,27 +377,77 @@ LiteRtDispatchInvocationContextT::Create(
   ov::CompiledModel compiled_model;
   try {
     if (npu_shared) {
-      // Stage the deduplicated pool to a temp file once per model, then hand it
-      // to NPUW. The temp file is a byte-for-byte copy of the contiguous pool
-      // span, starting at byte 0, so bin_offset resolves directly.
-      const std::string bank_path =
-          device_context.NpuBank().EnsureOnDisk(pool_ptr, pool_size);
-      if (bank_path.empty()) {
-        return litert::Error(
-            kLiteRtStatusErrorRuntimeFailure,
-            "Failed to stage shared weights bank to a temp file");
-      }
       ov::AnyMap import_properties;
       // NPU_USE_NPUW is required or the plain NPU plugin rejects the NPUW blob;
-      // WEIGHTS_PATH + ENABLE_WEIGHTLESS are required or NPUW asserts "Blob is
-      // weightless but no WEIGHTS_PATH nor MODEL_PTR property is provided!".
+      // ENABLE_WEIGHTLESS plus a weights source (the handle provider below, or
+      // WEIGHTS_PATH) is required or NPUW asserts "Blob is weightless but no
+      // WEIGHTS_PATH nor MODEL_PTR property is provided!".
       import_properties["NPU_USE_NPUW"] = std::string("YES");
-      import_properties[ov::weights_path.name()] = bank_path;
       import_properties[ov::enable_weightless.name()] = true;
-      LITERT_LOG(LITERT_INFO,
-                 "GlobalGraph: importing weightless NPU blob with "
-                 "WEIGHTS_PATH='%s' (%zu byte pool)",
-                 bank_path.c_str(), pool_size);
+
+      // Preferred: the pool already sits inside the mmapped model file, so hand
+      // NPUW a descriptor for that file plus the pool's [offset, size) region.
+      // NPUW maps only that window -- so the mapped base coincides with the pool
+      // start and each Constant's bin_offset (which is pool-relative) resolves
+      // as mapped->data() + bin_offset, exactly as with the staged copy -- and
+      // maps each weight on demand. No copy of the pool is made at all.
+      std::shared_ptr<litert::openvino::ModelFileHandle> model_file;
+      if (!FdBackedWeightsDisabled()) {
+        model_file =
+            device_context.EnsureModelFileHandle(exec_bytecode_buffer->fd);
+      }
+      if (model_file != nullptr) {
+        // The pool's offset in the file: where base_addr sits in the file, plus
+        // the pool's distance from base_addr. The bounds check above guarantees
+        // pool_ptr >= base_addr and that the whole span is inside the buffer.
+        //
+        // TODO: two assumptions here are trusted rather than verified, and both
+        // fail SILENTLY (shifted weights => wrong outputs, no crash):
+        //   1. that alloc_base_file_offset is meaningful. LiteRtMemBuffer has no
+        //      flag for it, and LiteRT's fallback path (see
+        //      SetModelSourceInfoFromAllocation in runtime/compiled_model.cc)
+        //      can leave it 0 while still reporting a valid fd.
+        //   2. that the OpenVINO runtime understands the region properties. One
+        //      that predates them ignores both and maps from offset 0.
+        // Cheap guard if either bites: read a few KiB back through the fd at
+        // each end of the computed region (pread / ifstream::seekg -- NOT
+        // ov::load_mmap_object, which libopenvino does not export) and memcmp
+        // against pool_ptr, falling back to staging on mismatch.
+        const size_t pool_file_offset =
+            exec_bytecode_buffer->alloc_base_file_offset +
+            static_cast<size_t>(
+                pool_ptr -
+                static_cast<const uint8_t*>(exec_bytecode_buffer->base_addr));
+        import_properties[kNpuwWeightsHandleProvider] =
+            litert::openvino::MakeFileHandleProvider(model_file);
+        import_properties[kNpuwWeightsHandleRegionOffset] =
+            static_cast<std::size_t>(pool_file_offset);
+        import_properties[kNpuwWeightsHandleRegionSize] =
+            static_cast<std::size_t>(pool_size);
+        LITERT_LOG(LITERT_INFO,
+                   "GlobalGraph: importing weightless NPU blob from the model "
+                   "file (fd %d, pool at file offset %zu, %zu bytes) -- no pool "
+                   "copy",
+                   model_file->fd(), pool_file_offset, pool_size);
+      } else {
+        // Fallback for a model that is not file-backed (e.g. JIT-compiled, so
+        // the flatbuffer was re-serialized in memory and carries no fd): stage
+        // the deduplicated pool to a temp file once per model. The temp file is
+        // a byte-for-byte copy of the contiguous pool span starting at byte 0,
+        // so bin_offset resolves directly.
+        const std::string bank_path =
+            device_context.NpuBank().EnsureOnDisk(pool_ptr, pool_size);
+        if (bank_path.empty()) {
+          return litert::Error(
+              kLiteRtStatusErrorRuntimeFailure,
+              "Failed to stage shared weights bank to a temp file");
+        }
+        import_properties[ov::weights_path.name()] = bank_path;
+        LITERT_LOG(LITERT_INFO,
+                   "GlobalGraph: importing weightless NPU blob with "
+                   "WEIGHTS_PATH='%s' (%zu byte pool)",
+                   bank_path.c_str(), pool_size);
+      }
       compiled_model = core->import_model(model_stream, device,
                                           import_properties);
     } else {

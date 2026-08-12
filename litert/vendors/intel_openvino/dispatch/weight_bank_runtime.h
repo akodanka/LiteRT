@@ -19,11 +19,13 @@
 #include <cstddef>
 #include <cstdint>
 #include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
 #include "openvino/runtime/compiled_model.hpp"
 #include "openvino/runtime/core.hpp"
+#include "openvino/runtime/file_handle.hpp"
 #include "openvino/runtime/remote_tensor.hpp"
 #include "openvino/runtime/tensor.hpp"
 #include "absl/base/thread_annotations.h"  // from @com_google_absl
@@ -111,6 +113,56 @@ class NpuSharedBank {
   // deployment's, not ours to unlink.
   bool owns_bank_file_ ABSL_GUARDED_BY(npu_bank_mutex_) = false;
 };
+
+// One duplicated handle to the file the model was mmapped from (the fd LiteRT
+// passes in LiteRtMemBuffer::fd), owned by the model's device context. Lets the
+// NPU weightless path hand NPUW the model file itself -- with the weight pool's
+// sub-region -- instead of staging a copy of the pool through NpuSharedBank, so
+// nothing is copied and NPUW mmaps each weight on demand.
+//
+// We keep our own duplicate rather than reusing the caller's fd because NPUW
+// calls the provider once per lazily mapped weight (LazyTensor's Const::eval),
+// any time during the compiled model's life: the handle must stay valid even if
+// the LiteRT model's own allocation is torn down first. The provider is handed
+// out as a shared_ptr capture for the same reason.
+class ModelFileHandle {
+ public:
+  // Duplicates |fd|. Returns nullptr if |fd| is negative or the dup fails --
+  // dup()/_dup() on a negative fd trips the CRT invalid parameter handler (i.e.
+  // aborts the process) on Windows, so the guard is load-bearing there.
+  static std::shared_ptr<ModelFileHandle> Create(int fd);
+
+  ~ModelFileHandle();
+  ModelFileHandle(const ModelFileHandle&) = delete;
+  ModelFileHandle& operator=(const ModelFileHandle&) = delete;
+  ModelFileHandle(ModelFileHandle&&) = delete;
+  ModelFileHandle& operator=(ModelFileHandle&&) = delete;
+
+  // Hands OpenVINO a handle to the model file. OpenVINO's ownership of the
+  // returned handle differs by platform, so this cannot be a plain accessor:
+  //   - POSIX: load_mmap_object(fd) stores the fd in a HandleHolder and
+  //     close()s it when the mapping dies, so every call returns a fresh dup().
+  //   - Windows: MapHolder::set_from_handle() DuplicateHandle()s internally and
+  //     closes only its own copy, leaving ours alone, so every call returns the
+  //     CRT fd's borrowed HANDLE (_get_osfhandle creates no kernel handle).
+  //     Duplicating here instead would leak one HANDLE per mapped weight.
+  // Returns an invalid handle if duplication fails; OpenVINO throws on it.
+  ov::FileHandle Handle() const;
+
+  // The descriptor this holder owns (for logging).
+  int fd() const { return fd_; }
+
+ private:
+  explicit ModelFileHandle(int owned_fd) : fd_(owned_fd) {}
+
+  const int fd_;
+};
+
+// Wraps |handle| as the callback NPUW's NPUW_WEIGHTS_HANDLE_PROVIDER expects.
+// Captures the shared_ptr by value so the descriptor outlives every mapping
+// NPUW makes through it.
+ov::FileHandleProvider MakeFileHandleProvider(
+    std::shared_ptr<ModelFileHandle> handle);
 
 }  // namespace litert::openvino
 
