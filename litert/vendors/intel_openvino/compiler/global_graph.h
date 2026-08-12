@@ -56,8 +56,8 @@ namespace litert::openvino {
 // v2 over v1: the pool is stored CONTIGUOUSLY (directory of {id, pool_offset,
 // size} then all bytes back-to-back) rather than interleaved {id, size, bytes},
 // so the NPU weightless path can stage it as a byte-for-byte copy of the
-// [pool_data_offset, +pool_size) span and a Constant's WLCA bin_offset
-// (== pool_offset) resolves to mmap->data() + bin_offset.
+// [pool_data_offset, +pool_size) span and a Constant's weight-origin offset
+// (== pool_offset) resolves to mmap->data() + offset.
 //
 // ONE type at BOTH compile and dispatch; every byte range is a borrowed
 // absl::Span<const uint8_t>:
@@ -119,7 +119,7 @@ class OpenVinoGlobalGraph {
   // Serialize the whole container to one blob (see layout above). Requires
   // |buffers| to be in strictly-ascending buffer_id order with pool_offset
   // equal to the running byte sum (DCHECK'd) -- the invariant that makes a
-  // Constant's WLCA bin_offset resolve at the staged temp file.
+  // Constant's weight-origin offset resolve at the staged temp file.
   std::string Serialize() const;
 
   // Zero-copy parse: returns a graph whose spans (pool, each buffer's bytes,

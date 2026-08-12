@@ -17,7 +17,9 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <vector>
 
@@ -178,6 +180,59 @@ void GraphIteratorDelegate::ConvertI2WeightsToI4(
              tensor_meta_info.m_tensor_name.c_str());
 }
 
+void GraphIteratorDelegate::TagWeightIdentity(
+    const litert::compiler::Tensor& tensor,
+    ov::frontend::tensorflow_lite::TensorMetaInfo& tensor_meta_info) const {
+  if (weight_bin_offsets_ == nullptr) return;
+
+  // A sparse tensor's bytes are NOT the pool bytes: the frontend swaps
+  // m_tensor_data for SparsityInfo::dense_data() (a buffer it densified itself)
+  // while still honouring m_source_id, so the identity would name a pool offset
+  // whose contents are the packed sparse encoding -- NPUW would then hand the
+  // compiled model the wrong weights, silently. fill_tensor_meta never populates
+  // m_sparsity_info today, so this is unreachable; the guard is here so enabling
+  // sparsity later degrades to "unshared" instead of "wrong".
+  if (tensor_meta_info.m_sparsity_info != nullptr &&
+      !tensor_meta_info.m_sparsity_info->is_disabled()) {
+    return;
+  }
+
+  const auto weights = tensor.Weights();
+  const int32_t buffer_id = weights.BufferId();
+  if (buffer_id < 0) return;  // no shared buffer backs this weight
+  const auto off_it = weight_bin_offsets_->find(buffer_id);
+  if (off_it == weight_bin_offsets_->end()) return;  // not in the shared pool
+
+  // Skip tiny/shape/scalar constants: sharing them saves nothing and they are
+  // the ones most likely to be folded away downstream.
+  const auto& shape = tensor_meta_info.m_partial_shape;
+  if (shape.is_dynamic()) return;
+  size_t num_elements = 1;
+  for (const auto& dim : shape.to_shape()) num_elements *= dim;
+  if (num_elements < 16) return;
+
+  // The identity says "this Constant IS the pool bytes at |offset|", and NPUW
+  // reads exactly get_byte_size() bytes from there. Only publish it when the
+  // pool buffer is the same size as the tensor OpenVINO will build, so a
+  // mis-sized buffer can never make NPUW read into the neighbouring weight.
+  // bitwidth (not size()) so sub-byte types (u2/i4) round the same way OpenVINO
+  // does.
+  const size_t expected_bytes =
+      (num_elements * tensor_meta_info.m_element_type.bitwidth() + 7) / 8;
+  if (weights.Bytes().size() != expected_bytes) {
+    LITERT_LOG(LITERT_WARNING,
+               "Weight sharing: tensor %s buffer is %zu bytes but its shape and "
+               "type need %zu; leaving it unshared",
+               tensor_meta_info.m_tensor_name.c_str(), weights.Bytes().size(),
+               expected_bytes);
+    return;
+  }
+
+  tensor_meta_info.m_source_id = kWeightSourceId;
+  tensor_meta_info.m_bin_offset = off_it->second;
+  identified_buffer_ids_.insert(buffer_id);
+}
+
 std::shared_ptr<ov::frontend::tensorflow_lite::DecoderBase>
 GraphIteratorDelegate::get_decoder() const {
   converted_weight_buffers_.clear();
@@ -225,6 +280,7 @@ GraphIteratorDelegate::get_decoder() const {
         // Signed i2 weights are rewritten before reaching OpenVINO, which
         // never sees ov::element::i2. The target device selects the
         // encoding: NPU/CPU use unsigned u2, GPU uses signed i4.
+        bool rewritten = false;
         if (tensor_meta_info.m_quantization_info) {
           const auto litert_type =
               static_cast<LiteRtElementType>(input.ElementType());
@@ -234,7 +290,13 @@ GraphIteratorDelegate::get_decoder() const {
             } else {
               ConvertI2WeightsToU2(input, tensor_meta_info);
             }
+            rewritten = true;
           }
+        }
+        // Only weights still pointing at their original pool bytes can carry a
+        // weight-sharing identity -- see TagWeightIdentity.
+        if (!rewritten) {
+          TagWeightIdentity(input, tensor_meta_info);
         }
       }
       input_meta_info.push_back(tensor_meta_info);

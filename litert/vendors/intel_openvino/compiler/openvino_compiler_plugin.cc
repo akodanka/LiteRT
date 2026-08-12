@@ -51,7 +51,6 @@
 #include "litert/compiler/cc/litert_op_options.h"
 #include "litert/vendors/c/litert_compiler_plugin.h"
 #include "litert/vendors/intel_openvino/bytecode_header.h"
-#include "litert/vendors/intel_openvino/compiler/alias_shared_constants.h"
 #include "litert/vendors/intel_openvino/compiler/global_graph.h"
 #include "litert/vendors/intel_openvino/compiler/graph_iterator.h"
 #include "litert/vendors/intel_openvino/compiler/openvino_compile_context.h"
@@ -552,8 +551,8 @@ LiteRtStatus LiteRtCompilerPluginCompile(
     litert::openvino::WeightBank weight_bank;
     litert::openvino::OpenVinoGlobalGraph global_graph;
     // Authoritative BufferId -> byte offset in the contiguous pool, built in the
-    // SAME ascending-id order Serialize() lays out, so a Constant's WLCA
-    // bin_offset equals its position in the temp file staged at dispatch.
+    // SAME ascending-id order Serialize() lays out, so a Constant's weight
+    // origin offset equals its position in the pool mapped at dispatch.
     std::map<int32_t, size_t> pool_offset_of;
     if (share_weights) {
       for (int p = 0; p < num_partitions; ++p) {
@@ -591,8 +590,8 @@ LiteRtStatus LiteRtCompilerPluginCompile(
       LITERT_RETURN_IF_ERROR(context.ConfigureForSoc(soc_model));
       if (share_npu) {
         // NPU shared path: turn on NPUW/CWAI so export_model emits a weightless
-        // blob whose constants are referenced by WeightlessCacheAttribute
-        // bin_offset instead of baked in.
+        // blob whose constants are referenced by their weight origin offset in
+        // the shared pool instead of baked in.
         context.ConfigureForNpuWeightSharing();
       }
 
@@ -600,13 +599,27 @@ LiteRtStatus LiteRtCompilerPluginCompile(
       litert::Expected<litert::compiler::Subgraph> expected_subgraph =
           model.Subgraph(partition_idx);
       if (expected_subgraph.HasValue()) {
+        // On the NPU shared path the iterator hands each weight its
+        // (source_id, pool offset) identity, so the TFLite frontend emits a
+        // descriptor-backed Constant that BOTH aliases the pool bytes (one
+        // address per BufferId across partitions -> NPUW dedups) and carries the
+        // offset NPUW resolves the weight from at runtime. Everywhere else the
+        // iterator gets no offsets and the frontend behaves as before.
+        auto delegate = std::make_shared<litert::openvino::GraphIteratorDelegate>(
+            compiler_plugin->ctx(), &expected_subgraph.Value(),
+            context.Device(), share_npu ? &pool_offset_of : nullptr);
         std::shared_ptr<ov::frontend::tensorflow_lite::GraphIterator>
-            graph_delegate =
-                std::make_shared<litert::openvino::GraphIteratorDelegate>(
-                    compiler_plugin->ctx(), &expected_subgraph.Value(),
-                    context.Device());
+            graph_delegate = delegate;
         auto input_model = tflite_fe->load(graph_delegate);
         LITERT_LOG(LITERT_INFO, "Model loaded");
+        if (share_npu) {
+          // Not comparable to pool_offset_of.size(): that is the union over all
+          // partitions, this is what THIS partition uses.
+          LITERT_LOG(LITERT_INFO,
+                     "Weight sharing (NPU) p%d: %zu weights bound to the shared "
+                     "pool; any others stay baked in this partition",
+                     partition_idx, delegate->NumIdentifiedWeights());
+        }
         auto ov_model = tflite_fe->convert(input_model);
 
         // Run NPU-specific optimization passes.
@@ -614,22 +627,17 @@ LiteRtStatus LiteRtCompilerPluginCompile(
 
         ov::AnyMap configs = context.ConfigsMap();
         std::map<std::string, uint32_t> const_map;
-        if (share_weights) {
-          if (share_npu) {
-            // NPU: alias+tag weights (see AliasAndTagSharedConstants).
-            litert::openvino::AliasAndTagSharedConstants(
-                ov_model, weight_bank, pool_offset_of, partition_idx);
-          } else {
-            // GPU: convert weights to Parameters bound to the shared bank at
-            // dispatch; const_map records friendly_name -> BufferId.
-            const size_t converted =
-                litert::openvino::ConvertWeightsToParameters(
-                    ov_model, weight_bank, &const_map);
-            LITERT_LOG(LITERT_INFO,
-                       "Weight sharing (GPU): converted %zu weights to "
-                       "parameters in partition %d",
-                       converted, partition_idx);
-          }
+        // NPU needs nothing here: the weights were already identified and
+        // aliased as the frontend built them (see graph_delegate above).
+        if (share_weights && !share_npu) {
+          // GPU: convert weights to Parameters bound to the shared bank at
+          // dispatch; const_map records friendly_name -> BufferId.
+          const size_t converted = litert::openvino::ConvertWeightsToParameters(
+              ov_model, weight_bank, &const_map);
+          LITERT_LOG(LITERT_INFO,
+                     "Weight sharing (GPU): converted %zu weights to "
+                     "parameters in partition %d",
+                     converted, partition_idx);
         }
 
         // Compile using the per-partition device and properties.

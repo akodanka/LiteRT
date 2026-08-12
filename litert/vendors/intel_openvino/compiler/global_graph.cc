@@ -110,8 +110,8 @@ std::string OpenVinoGlobalGraph::Serialize() const {
   // it to a temp file byte-for-byte. First the directory, then the contiguous
   // pool bytes. |buffers| MUST be in strictly-ascending buffer_id order with
   // pool_offset == the running byte sum: that is the invariant that makes a
-  // Constant's WeightlessCacheAttribute bin_offset (== pool_offset) resolve to
-  // mmap->data() + bin_offset in the staged temp file.
+  // Constant's weight-origin offset (== pool_offset) resolve to
+  // mmap->data() + offset in the staged temp file.
   PutU32(out, static_cast<uint32_t>(buffers.size()));
   uint64_t pool_size = 0;
   bool have_prev = false;
@@ -123,7 +123,7 @@ std::string OpenVinoGlobalGraph::Serialize() const {
     ABSL_DCHECK_EQ(entry.pool_offset, pool_size)
         << "OpenVinoGlobalGraph: pool_offset must equal the running byte sum";
     PutU32(out, entry.id);
-    PutU64(out, pool_size);  // pool_offset (== WLCA bin_offset at dispatch)
+    PutU64(out, pool_size);  // pool_offset (== weight-origin offset at dispatch)
     PutU64(out, entry.bytes.size());
     pool_size += entry.bytes.size();
     have_prev = true;
@@ -199,7 +199,7 @@ litert::Expected<OpenVinoGlobalGraph> OpenVinoGlobalGraph::Parse(
   graph.pool = absl::MakeConstSpan(pool_base, static_cast<size_t>(pool_size));
   reader.p += pool_size;
   // Every {offset, size} must lie within the pool; this is what guarantees a
-  // WLCA bin_offset resolves inside the staged temp file (bin_offset + size
+  // weight-origin offset resolves inside the staged temp file (offset + size
   // <= pool_size) and that a GPU buffer view stays in-bounds.
   graph.buffers.reserve(dir.size());
   for (const auto& [id, off_sz] : dir) {
