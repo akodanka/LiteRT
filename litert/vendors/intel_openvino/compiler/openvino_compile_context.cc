@@ -102,6 +102,12 @@ OpenVinoCompileContext::OpenVinoCompileContext() {
         context.sdpa_pad_kv_to_alignment_ = (value == "true");
         continue;
       }
+      if (key == "disable_weight_sharing") {
+        LITERT_LOG(LITERT_INFO, "Custom config: disable_weight_sharing = %s",
+                   value.c_str());
+        context.disable_weight_sharing_ = (value == "true");
+        continue;
+      }
       context.configs_map_[key] = value;
       LITERT_LOG(LITERT_INFO, "Custom config: %s = %s", key.c_str(),
                  value.c_str());
@@ -144,6 +150,21 @@ OpenVinoCompileContext::OpenVinoCompileContext() {
       if (key.empty()) continue;
       if (key == "optimize_fq_after_matmul") {
         context.eliminate_fq_after_matmul_ = (value == "true");
+        continue;
+      }
+      if (key == "fuse_split_attention_to_sdpa") {
+        context.fuse_split_attention_to_sdpa_ = (value == "true");
+        continue;
+      }
+      if (key == "sdpa_pad_kv_to_alignment") {
+        context.sdpa_pad_kv_to_alignment_ = (value == "true");
+        continue;
+      }
+      if (key == "disable_weight_sharing") {
+        // Weight sharing is an all-or-nothing decision across partitions, so a
+        // per-graph entry still disables it model-wide. Consumed here (rather
+        // than forwarded) so it never reaches the OpenVINO Core as a property.
+        context.disable_weight_sharing_ = (value == "true");
         continue;
       }
       context.configs_map_[key] = value;

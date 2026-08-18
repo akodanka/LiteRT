@@ -100,6 +100,15 @@ properties. Internal keys (all default `false`):
     `fuse_split_attention_to_sdpa=true`. When the merged KV sequence length is
     not a multiple of 16, pad K/V (and the mask) up to the next multiple so the
     block still fuses.
+-   `disable_weight_sharing` — debug / benchmarking switch. Cross-partition
+    weight sharing is normally enabled automatically whenever a model has more
+    than one partition and every partition targets the same shareable backend
+    (all NPU or all GPU). Setting this to `"true"` forces the standalone path
+    instead: each partition gets its own baked-weights bytecode, and on NPU the
+    NPUW/CWAI weightless knobs are not applied. Use it to A/B the NPUW path
+    against a plain per-device compile of the same graph; it costs one weight
+    copy per partition, so it is not a shipping configuration. Because sharing
+    is an all-or-nothing decision, a per-graph entry disables it model-wide.
 
 ## Usage Example
 
@@ -247,4 +256,28 @@ void ConfigureOpenVinoFromOptions(ov::Core& core, const IntelOpenVinoOptions& op
 
 -   Graph Backend (per partition, when no override is set): NPU
 -   Performance Mode: Latency
+
+## Runtime (dispatch) properties
+
+The options above are consumed at **compile** time and are baked into the AOT
+blob. OpenVINO also has run-time-only device properties that can only be
+supplied when the blob is imported — `NPU_BYPASS_UMD_CACHING` for instance is
+run-time only, and `NPU_TURBO` is accepted in both phases. The dispatch API has
+no vendor-options channel, so those are passed through an environment variable:
+
+```bash
+export LITERT_OV_IMPORT_PROPERTIES="NPU_TURBO=YES,NPU_BYPASS_UMD_CACHING=NO"
+```
+
+Comma-separated `KEY=VALUE` pairs, forwarded verbatim to
+`ov::Core::import_model()` for every graph. OpenVINO validates them, so an
+unknown or malformed property fails the import with the plugin's own message
+instead of being silently ignored. Unset (the default) leaves the import path
+unchanged. The weightless-import keys (`NPU_USE_NPUW`, `WEIGHTS_PATH`,
+`ENABLE_WEIGHTLESS`) always take precedence, since they are load-bearing for a
+shared-weights NPU blob.
+
+Other dispatch-side environment overrides, for reference: `LITERT_OV_WEIGHTS_PATH`
+(stage from / reuse an external weights file instead of the pool embedded in the
+model, see `dispatch/weight_bank_runtime.cc`).
 

@@ -60,6 +60,13 @@ class OpenVinoCompileContext {
   const std::string& Device() const { return device_; }
   const ov::AnyMap& ConfigsMap() const { return configs_map_; }
 
+  // True when the caller asked to compile with cross-partition weight sharing
+  // off (`disable_weight_sharing=true`).  A debug/benchmarking switch: it makes
+  // each partition emit standalone baked-weights bytecode, which is the only
+  // way to A/B the NPUW/CWAI path against a plain per-device compile of the
+  // same graph.  Defaults to false, i.e. today's behaviour.
+  bool WeightSharingDisabled() const { return disable_weight_sharing_; }
+
  private:
   // Applies default configuration (NPU device, LATENCY mode).  Construction
   // must go through Create().
@@ -74,6 +81,7 @@ class OpenVinoCompileContext {
   // whether the `FuseSplitAttentionToSDPA` pass pads KV sequences up to the NPU
   // SDPA kernel's required alignment when fusing.
   bool sdpa_pad_kv_to_alignment_ = true;
+  bool disable_weight_sharing_ = false;
 };
 
 }  // namespace openvino

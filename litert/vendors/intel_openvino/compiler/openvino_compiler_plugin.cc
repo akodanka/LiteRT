@@ -539,7 +539,16 @@ LiteRtStatus LiteRtCompilerPluginCompile(
           litert::openvino::OpenVinoCompileContext::Create(
               compiler_plugin->GetIntelOpenVinoOptions(), p));
       const std::string& dev = probe.Device();
-      if (dev != "GPU" && dev != "NPU") {
+      if (probe.WeightSharingDisabled()) {
+        // Debug/benchmarking switch (`disable_weight_sharing=true`): fall back
+        // to standalone baked-weights bytecode per partition. This is what
+        // makes the NPUW/CWAI path A/B-able against a plain per-device compile
+        // of the same graph -- see NPUW_LLM_S1_RUNBOOK.md.
+        LITERT_LOG(LITERT_INFO,
+                   "Weight sharing disabled by config on partition %d; "
+                   "compiling standalone baked-weights bytecode", p);
+        share_weights = false;
+      } else if (dev != "GPU" && dev != "NPU") {
         share_weights = false;  // only GPU and NPU support shared dispatch
       } else if (share_device.empty()) {
         share_device = dev;  // first partition sets the required common device

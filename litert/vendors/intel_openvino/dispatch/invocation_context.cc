@@ -19,6 +19,7 @@
 #include <chrono>  // NOLINT
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <ios>
@@ -51,6 +52,51 @@
 #include "litert/vendors/intel_openvino/dispatch/weight_bank_runtime.h"
 
 namespace {
+
+// Extra properties for core->import_model(), parsed from
+// LITERT_OV_IMPORT_PROPERTIES as a comma-separated KEY=VALUE list.
+//
+// Compile-time properties are baked into the AOT blob, but OpenVINO also has
+// run-time-only device properties that can ONLY be supplied at import (e.g.
+// NPU_BYPASS_UMD_CACHING, which is OptionMode::RunTime; NPU_TURBO is accepted
+// in both phases). The dispatch API has no vendor-options channel, so this env
+// var is the way to reach them -- matching the LITERT_OV_* convention already
+// used for the weights-path overrides in weight_bank_runtime.cc.
+//
+// Values are passed through verbatim as strings; OpenVINO parses and validates
+// them, and an unknown or malformed property surfaces as an import failure with
+// the plugin's own message rather than being silently dropped. Empty when the
+// variable is unset, so the default import path is byte-identical to before.
+ov::AnyMap ImportPropertiesFromEnv() {
+  ov::AnyMap properties;
+  const char* spec = std::getenv("LITERT_OV_IMPORT_PROPERTIES");
+  if (spec == nullptr || spec[0] == '\0') return properties;
+
+  const std::string list(spec);
+  size_t pos = 0;
+  while (pos < list.size()) {
+    const size_t comma = list.find(',', pos);
+    const std::string entry =
+        list.substr(pos, comma == std::string::npos ? std::string::npos
+                                                   : comma - pos);
+    const size_t eq = entry.find('=');
+    if (eq == std::string::npos || eq == 0) {
+      LITERT_LOG(LITERT_WARNING,
+                 "LITERT_OV_IMPORT_PROPERTIES: ignoring malformed entry '%s' "
+                 "(expected KEY=VALUE)",
+                 entry.c_str());
+    } else {
+      const std::string key = entry.substr(0, eq);
+      const std::string value = entry.substr(eq + 1);
+      LITERT_LOG(LITERT_INFO, "Import property from env: %s = %s", key.c_str(),
+                 value.c_str());
+      properties[key] = value;
+    }
+    if (comma == std::string::npos) break;
+    pos = comma + 1;
+  }
+  return properties;
+}
 
 // This class is copied from the OpenVINO codebase with minor modifications
 // for Google C++ Style Guide compliance. It wraps a pre-allocated memory
@@ -338,6 +384,9 @@ LiteRtDispatchInvocationContextT::Create(
   }
 
   ov::CompiledModel compiled_model;
+  // Run-time-only device properties (see ImportPropertiesFromEnv). Applied to
+  // both import paths; empty unless LITERT_OV_IMPORT_PROPERTIES is set.
+  const ov::AnyMap env_import_properties = ImportPropertiesFromEnv();
   try {
     if (npu_shared) {
       // Stage the deduplicated pool to a temp file once per model, then hand it
@@ -350,7 +399,9 @@ LiteRtDispatchInvocationContextT::Create(
             kLiteRtStatusErrorRuntimeFailure,
             "Failed to stage shared weights bank to a temp file");
       }
-      ov::AnyMap import_properties;
+      // Env-provided properties go in first so the three keys below always win:
+      // they are load-bearing for a weightless NPUW blob, not preferences.
+      ov::AnyMap import_properties = env_import_properties;
       // NPU_USE_NPUW is required or the plain NPU plugin rejects the NPUW blob;
       // WEIGHTS_PATH + ENABLE_WEIGHTLESS are required or NPUW asserts "Blob is
       // weightless but no WEIGHTS_PATH nor MODEL_PTR property is provided!".
@@ -364,7 +415,8 @@ LiteRtDispatchInvocationContextT::Create(
       compiled_model =
           core->import_model(model_stream, device, import_properties);
     } else {
-      compiled_model = core->import_model(model_stream, device);
+      compiled_model =
+          core->import_model(model_stream, device, env_import_properties);
     }
   } catch (const std::exception& e) {
     return litert::Error(kLiteRtStatusErrorRuntimeFailure, e.what());
