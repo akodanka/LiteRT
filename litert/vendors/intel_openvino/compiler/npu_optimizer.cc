@@ -16,8 +16,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "openvino/core/graph_util.hpp"
@@ -90,6 +92,78 @@ ov::Output<ov::Node> PadEndOfAxis(const ov::Output<ov::Node>& input,
   return std::make_shared<ov::op::v1::Pad>(input, pads_begin, pads_end, value,
                                            ov::op::PadMode::CONSTANT)
       ->output(0);
+}
+
+// Memo for PadMaskKvAxis, keyed on the tensor being padded and the pad amount.
+using MaskPadCache =
+    std::map<std::pair<ov::Output<ov::Node>, int64_t>, ov::Output<ov::Node>>;
+
+// Pads |mask| by |pad_amount| at the end of its last (key) axis.
+//
+// Two economies over a plain PadEndOfAxis, both of which matter because the
+// additive mask is by far the largest tensor around a long-context attention
+// layer:
+//
+//  * Results are memoised in |cache|. Every attention layer of the same kind
+//    consumes the *same* mask tensor and pads it by the same amount, so without
+//    this each layer builds its own Pad over a full-size mask.
+//  * When |mask| is a pure tile -- a Concat on a non-last axis all of whose
+//    inputs are the same tensor, which is how a [.., S_q, S_kv] mask is
+//    broadcast up to a GQA-group-folded query length -- the pad is applied to
+//    the tile *source* and the tile is rebuilt on top. Appending columns at the
+//    end of the last axis commutes with a Concat on any other axis, so this is
+//    exact, and it shrinks the padded tensor by the tile factor.
+//
+// On Gemma-4 12B prefill the two together replace 7 pads of a 135 MB tiled mask
+// with one pad of an 8 MB untiled one.
+ov::Output<ov::Node> PadMaskKvAxis(const ov::Output<ov::Node>& mask,
+                                   int64_t rank, int64_t pad_amount,
+                                   float pad_value, MaskPadCache& cache,
+                                   ov::NodeVector& new_nodes) {
+  if (pad_amount == 0) {
+    return mask;
+  }
+  const auto key = std::make_pair(mask, pad_amount);
+  const auto hit = cache.find(key);
+  if (hit != cache.end()) {
+    return hit->second;
+  }
+
+  auto tile = std::dynamic_pointer_cast<ov::op::v0::Concat>(
+      mask.get_node_shared_ptr());
+  bool pure_tile = tile != nullptr && tile->get_input_size() > 1 &&
+                   mask.get_partial_shape().rank().is_static();
+  int64_t tile_axis = 0;
+  if (pure_tile) {
+    tile_axis = tile->get_axis();
+    if (tile_axis < 0) tile_axis += rank;
+    // Padding the last axis only commutes with a Concat on a different axis.
+    pure_tile = tile_axis != rank - 1;
+  }
+  if (pure_tile) {
+    for (size_t i = 1; i < tile->get_input_size(); ++i) {
+      if (tile->input_value(i) != tile->input_value(0)) {
+        pure_tile = false;
+        break;
+      }
+    }
+  }
+
+  ov::Output<ov::Node> result;
+  if (pure_tile) {
+    auto padded_src = PadEndOfAxis(tile->input_value(0), rank, /*axis=*/-1,
+                                   pad_amount, pad_value);
+    new_nodes.push_back(padded_src.get_node_shared_ptr());
+    auto new_tile = std::make_shared<ov::op::v0::Concat>(
+        ov::OutputVector(tile->get_input_size(), padded_src), tile_axis);
+    new_nodes.push_back(new_tile);
+    result = new_tile->output(0);
+  } else {
+    result = PadEndOfAxis(mask, rank, /*axis=*/-1, pad_amount, pad_value);
+    new_nodes.push_back(result.get_node_shared_ptr());
+  }
+  cache.emplace(key, result);
+  return result;
 }
 
 }  // namespace
@@ -181,6 +255,11 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
   auto attn_new = pattern::wrap_type<ov::op::v0::MatMul>(
       {pattern::any_input(), v_new_input});
   auto output_add = pattern::wrap_type<ov::op::v1::Add>({attn_cache, attn_new});
+
+  // Shared across every match this pass makes, so all attention layers reading
+  // the same mask tensor share one padded copy of it. Held by shared_ptr
+  // because the callback below captures by value.
+  auto mask_pad_cache = std::make_shared<MaskPadCache>();
 
   ov::matcher_pass_callback callback = [=](pattern::Matcher& m) {
     const std::string root_name = m.get_match_root()->get_friendly_name();
@@ -376,15 +455,39 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
       return false;
     }
 
+    // Align by padding the current step's KV, not the merged KV.
+    //
+    // Appending |kv_pad| entries at the end of the concatenated axis of the
+    // *last* Concat input is the same tensor as appending them to the Concat
+    // output, because the cache comes first and the padding lands at the very
+    // end of the sequence either way. Doing it on the input is much cheaper --
+    // the Pad copies one step of KV instead of the whole cache -- and it leaves
+    // the Concat feeding the SDPA directly, which NPUW's `attn::SDPA`
+    // isolation pattern requires: it permits only Unsqueeze/Broadcast/Reshape
+    // between the KV Concat and the SDPA, so a Pad in that position hides the
+    // layer from NPUW_ONLINE_ISOLATE=ATTN.
+    //
+    // Note the pad axis is the *concat* axis, which is the sequence axis in
+    // whichever layout the cache is stored in; the optional Transpose below
+    // then carries the padding to axis -2 along with everything else.
+    ov::Output<ov::Node> k_new_in = PadEndOfAxis(
+        k_new, /*rank=*/4, k_concat_axis, kv_pad, /*pad_value=*/0.0f);
+    ov::Output<ov::Node> v_new_in = PadEndOfAxis(
+        v_new, /*rank=*/4, v_concat_axis, kv_pad, /*pad_value=*/0.0f);
+
     auto k_concat = std::make_shared<ov::op::v0::Concat>(
-        ov::OutputVector{k_cache, k_new}, k_concat_axis);
+        ov::OutputVector{k_cache, k_new_in}, k_concat_axis);
     auto v_concat = std::make_shared<ov::op::v0::Concat>(
-        ov::OutputVector{v_cache, v_new}, v_concat_axis);
+        ov::OutputVector{v_cache, v_new_in}, v_concat_axis);
 
     std::shared_ptr<ov::Node> k_input = k_concat;
     std::shared_ptr<ov::Node> v_input = v_concat;
 
     ov::NodeVector new_nodes{k_concat, v_concat};
+    if (kv_pad > 0) {
+      new_nodes.push_back(k_new_in.get_node_shared_ptr());
+      new_nodes.push_back(v_new_in.get_node_shared_ptr());
+    }
     auto add_transpose = [&new_nodes](std::shared_ptr<ov::Node>& target) {
       auto perm = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4},
                                                {0, 1, 3, 2});
@@ -396,35 +499,24 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
     if (k_is_transposed) add_transpose(k_input);
     if (v_is_transposed) add_transpose(v_input);
 
-    // After Concat (+ optional Transpose), K and V are in standard
-    // [B,H,S_kv,D] layout. Pad the S_kv dim (axis -2) up to the alignment.
-    // PadEndOfAxis short-circuits to the original output when kv_pad == 0,
-    // so the explicit guard is unnecessary.
-    ov::Output<ov::Node> key_out =
-        PadEndOfAxis(k_input->output(0), /*rank=*/4, /*axis=*/-2, kv_pad,
-                     /*pad_value=*/0.0f);
-    ov::Output<ov::Node> val_out =
-        PadEndOfAxis(v_input->output(0), /*rank=*/4, /*axis=*/-2, kv_pad,
-                     /*pad_value=*/0.0f);
-    if (kv_pad > 0) {
-      new_nodes.push_back(key_out.get_node_shared_ptr());
-      new_nodes.push_back(val_out.get_node_shared_ptr());
-    }
+    // After Concat (+ optional Transpose) K and V are in the standard
+    // [B,H,S_kv,D] layout the SDPA op expects, already aligned by the pad on
+    // the new-KV branch above.
+    ov::Output<ov::Node> key_out = k_input->output(0);
+    ov::Output<ov::Node> val_out = v_input->output(0);
 
-    // Mask. Its KV axis (-1) must match the (possibly padded) KV length, so
-    // pad it by the same amount with a large finite negative bias to mask
-    // the padded positions in softmax (kSdpaPadMaskBias is -3e4: small enough
-    // that exp underflows, large enough that fp16 stays finite, avoiding
-    // NaN in flash-attention tile rescaling).
+    // Mask. Its KV axis (-1) must match the padded KV length, so pad it by the
+    // same amount with a negative bias that excludes the padded key positions
+    // from the softmax (kSdpaPadMaskBias, -100: exp() of it underflows to zero
+    // even in fp16, while staying finite so flash-attention tile rescaling
+    // cannot produce NaN).
     const int64_t mask_rank =
         mask_value.get_partial_shape().rank().is_static()
             ? mask_value.get_partial_shape().rank().get_length()
             : 4;
-    ov::Output<ov::Node> attn_mask = PadEndOfAxis(
-        mask_value, mask_rank, /*axis=*/-1, kv_pad, kSdpaPadMaskBias);
-    if (kv_pad > 0) {
-      new_nodes.push_back(attn_mask.get_node_shared_ptr());
-    }
+    ov::Output<ov::Node> attn_mask =
+        PadMaskKvAxis(mask_value, mask_rank, kv_pad, kSdpaPadMaskBias,
+                      *mask_pad_cache, new_nodes);
 
     // Scale = 1.0: any required scaling is assumed pre-applied to Q.
     auto scale_const = ov::op::v0::Constant::create(
@@ -438,7 +530,10 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
     sdpa->set_friendly_name(add_node->get_friendly_name());
     ov::copy_runtime_info(m.get_matched_nodes(), new_nodes);
     ov::replace_node(add_node, sdpa);
-    LITERT_LOG(LITERT_DEBUG,
+    // INFO, not DEBUG: the plugin pins its log level to LITERT_INFO, so a
+    // DEBUG line here is unreachable and there is otherwise no way to confirm
+    // from a compile log that the fusion fired at all.
+    LITERT_LOG(LITERT_INFO,
                "FuseSplitAttentionToSDPA: fused split-attention into "
                "v13::ScaledDotProductAttention '%s' "
                "(k_pre_transposed=%d, v_pre_transposed=%d, "

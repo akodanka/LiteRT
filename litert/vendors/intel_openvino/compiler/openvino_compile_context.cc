@@ -89,6 +89,12 @@ OpenVinoCompileContext::OpenVinoCompileContext() {
         context.eliminate_fq_after_matmul_ = (value == "true");
         continue;
       }
+      if (key == "constant_fold") {
+        LITERT_LOG(LITERT_INFO, "Custom config: constant_fold = %s",
+                   value.c_str());
+        context.constant_fold_ = (value == "true");
+        continue;
+      }
       if (key == "fuse_split_attention_to_sdpa") {
         LITERT_LOG(LITERT_INFO,
                    "Custom config: fuse_split_attention_to_sdpa = %s",
@@ -152,6 +158,10 @@ OpenVinoCompileContext::OpenVinoCompileContext() {
         context.eliminate_fq_after_matmul_ = (value == "true");
         continue;
       }
+      if (key == "constant_fold") {
+        context.constant_fold_ = (value == "true");
+        continue;
+      }
       if (key == "fuse_split_attention_to_sdpa") {
         context.fuse_split_attention_to_sdpa_ = (value == "true");
         continue;
@@ -201,7 +211,7 @@ void OpenVinoCompileContext::OptimizeModel(
     const std::shared_ptr<ov::Model>& model) const {
   if (device_ == "NPU") {
     NpuOptimizer()
-        .SetConstantFold(true)
+        .SetConstantFold(constant_fold_)
         .SetEliminateMatMulFakeQuantize(eliminate_fq_after_matmul_)
         .SetFuseSplitAttentionToSDPA(fuse_split_attention_to_sdpa_)
         .SetSdpaPadKvToAlignment(sdpa_pad_kv_to_alignment_)

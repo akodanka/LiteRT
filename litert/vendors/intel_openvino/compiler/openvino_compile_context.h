@@ -75,6 +75,13 @@ class OpenVinoCompileContext {
   std::string device_ = "NPU";
   ov::AnyMap configs_map_;
   bool eliminate_fq_after_matmul_ = false;
+  // Enabled by default on NPU: folding constants up front resolves shapes that
+  // would otherwise stay dynamic into the downstream NPU passes.  Exposed as
+  // `constant_fold` only so it can be turned off for diagnostics -- notably to
+  // A/B whether a graph property (e.g. cross-layer Const aliasing) originates
+  // in the frontend or in ConstantFolding.  Turning it off is expected to leave
+  // dynamic shapes behind, which downstream may reject.
+  bool constant_fold_ = true;
   bool fuse_split_attention_to_sdpa_ = false;
   // `sdpa_pad_kv_to_alignment_` is only meaningful when
   // `fuse_split_attention_to_sdpa_` is true and enabled by default. It controls

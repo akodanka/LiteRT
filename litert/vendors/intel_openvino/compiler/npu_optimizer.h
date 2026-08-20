@@ -77,9 +77,16 @@ class FuseSplitAttentionToSDPA : public ov::pass::MatcherPass {
   OPENVINO_MATCHER_PASS_RTTI("FuseSplitAttentionToSDPA");
   // |pad_kv_to_alignment| controls behavior when the merged KV sequence length
   // is not a multiple of the NPU SDPA kernel's required alignment (16). When
-  // false, such blocks are left unfused. When true(default), the merged K/V
-  // is padded up to the next multiple of 16 and the mask is padded with a
-  // large negative bias so the padded key positions are excluded from softmax.
+  // false, such blocks are left unfused. When true(default), the KV sequence is
+  // extended to the next multiple of 16 and the mask is padded with a negative
+  // bias so the padded key positions are excluded from softmax.
+  //
+  // The KV padding is applied to the current step's K/V — the last input of the
+  // Concat — rather than to the Concat output. The result is the same tensor,
+  // but the copy is proportional to one step instead of the whole cache, and the
+  // Concat is left feeding the SDPA directly, which NPUW's attention-isolation
+  // pattern requires. The padded mask is shared by every block that reads the
+  // same mask, and is built by padding the tile source when the mask is a tile.
   explicit FuseSplitAttentionToSDPA(bool pad_kv_to_alignment);
 };
 
