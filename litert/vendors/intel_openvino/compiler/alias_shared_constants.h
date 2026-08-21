@@ -55,6 +55,36 @@ size_t AliasAndTagSharedConstants(
     const std::shared_ptr<ov::Model>& ov_model, const WeightBank& weight_bank,
     const std::map<int32_t, size_t>& pool_offset_of, int partition_idx);
 
+// Gives every consumer of a small multi-use Constant its own Constant node.
+//
+// WHY: the tflite export CSEs constants across decoder layers by value, so one
+// Const node ends up with fan-out into several layers. NPUW's FOLD match bank
+// then sees layers whose op multisets differ *only* in Const count and aborts
+// with "Number of layers in match bank differs from # of function calls".
+// Splitting the node restores uniform layer bodies.
+//
+// This does NOT cost weight sharing, and that is the whole point: there are two
+// ways to share a constant and only one of them upsets FOLD.
+//   - one NODE with fan-out N  -> layers differ in Const count. Hostile.
+//   - N nodes, one DATA POINTER -> layers uniform, NPUW still dedups to a single
+//     allocation. Benign. This is what AliasAndTagSharedConstants produces.
+// So this pass converts the first form into the second. Run it BEFORE
+// AliasAndTagSharedConstants: clones keep the original's friendly name, so
+// BufferIdOfName resolves them all to the same BufferId and they are all
+// re-aliased onto the one pool buffer.
+//
+// Clones share the original's data buffer (Constant's copy ctor shares the
+// AlignedBuffer by shared_ptr), so this copies no weight bytes.
+//
+// |max_bytes| is a safety belt: Constants larger than it are left alone so a
+// genuinely large shared weight can never be duplicated. On Gemma-4 12B no
+// Constant with fan-out > 1 exceeds 2 KB -- the real MatMul weights all have
+// fan-out 1 -- so at 64 KB this excludes nothing today.
+//
+// Returns the number of clones created.
+size_t CloneMultiUseConstants(const std::shared_ptr<ov::Model>& ov_model,
+                              size_t max_bytes, int partition_idx);
+
 }  // namespace litert::openvino
 
 #endif  // LITERT_VENDORS_INTEL_OPENVINO_COMPILER_ALIAS_SHARED_CONSTANTS_H_

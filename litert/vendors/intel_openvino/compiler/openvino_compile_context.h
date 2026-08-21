@@ -67,6 +67,13 @@ class OpenVinoCompileContext {
   // same graph.  Defaults to false, i.e. today's behaviour.
   bool WeightSharingDisabled() const { return disable_weight_sharing_; }
 
+  // True when `clone_shared_constants=true` was passed. Splits Constants that
+  // the tflite export CSE'd across decoder layers so NPUW's FOLD match bank
+  // sees uniform layer bodies. See CloneMultiUseConstants(). Off by default:
+  // it only matters when NPUW_FOLD is on, and leaving it off keeps existing
+  // rows byte-comparable.
+  bool CloneSharedConstants() const { return clone_shared_constants_; }
+
  private:
   // Applies default configuration (NPU device, LATENCY mode).  Construction
   // must go through Create().
@@ -82,6 +89,8 @@ class OpenVinoCompileContext {
   // in the frontend or in ConstantFolding.  Turning it off is expected to leave
   // dynamic shapes behind, which downstream may reject.
   bool constant_fold_ = true;
+  // See CloneSharedConstants() above. Diagnostic/experimental, default off.
+  bool clone_shared_constants_ = false;
   bool fuse_split_attention_to_sdpa_ = false;
   // `sdpa_pad_kv_to_alignment_` is only meaningful when
   // `fuse_split_attention_to_sdpa_` is true and enabled by default. It controls

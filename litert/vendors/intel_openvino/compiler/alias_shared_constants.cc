@@ -15,11 +15,13 @@
 
 #include "litert/vendors/intel_openvino/compiler/alias_shared_constants.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
 #include <map>
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -110,6 +112,61 @@ size_t AliasAndTagSharedConstants(
       "(bytes differ from pool -- content-altered, e.g. i2->u2)",
       partition_idx, aliased, tagged, mismatched);
   return aliased;
+}
+
+size_t CloneMultiUseConstants(const std::shared_ptr<ov::Model>& ov_model,
+                              size_t max_bytes, int partition_idx) {
+  // Collect before mutating, as above.
+  std::vector<std::shared_ptr<ov::op::v0::Constant>> candidates;
+  for (const auto& node : ov_model->get_ordered_ops()) {
+    auto cnst = ov::as_type_ptr<ov::op::v0::Constant>(node);
+    if (!cnst) continue;
+    if (cnst->get_byte_size() > max_bytes) continue;
+    if (cnst->get_output_target_inputs(0).size() < 2) continue;
+    candidates.push_back(cnst);
+  }
+
+  size_t cloned = 0;
+  size_t widest = 0;
+  for (const auto& cnst : candidates) {
+    // get_target_inputs() is a std::set ordered by node ADDRESS, which varies
+    // run to run. Sort by name so a rebuild hands the same clone to the same
+    // consumer and two compile logs stay diffable.
+    std::vector<std::pair<ov::Node*, size_t>> targets;
+    for (const auto& in : cnst->get_output_target_inputs(0)) {
+      targets.emplace_back(in.get_node(), in.get_index());
+    }
+    std::sort(targets.begin(), targets.end(),
+              [](const std::pair<ov::Node*, size_t>& a,
+                 const std::pair<ov::Node*, size_t>& b) {
+                const std::string an = a.first->get_friendly_name();
+                const std::string bn = b.first->get_friendly_name();
+                if (an != bn) return an < bn;
+                return a.second < b.second;
+              });
+    widest = std::max(widest, targets.size());
+
+    // Consumer 0 keeps the original; every other consumer gets its own node.
+    for (size_t i = 1; i < targets.size(); ++i) {
+      auto clone = cnst->clone_with_new_inputs(ov::OutputVector{});
+      // Same friendly name on purpose: AliasAndTagSharedConstants looks the
+      // BufferId up by name, so every clone re-aliases onto the one pool
+      // buffer and stays a single allocation.
+      clone->set_friendly_name(cnst->get_friendly_name());
+      // Deliberately NOT copying the output tensor names -- those are meant to
+      // be unique per model and a Constant does not need them.
+      targets[i].first->input(targets[i].second)
+          .replace_source_output(clone->output(0));
+      ++cloned;
+    }
+  }
+
+  LITERT_LOG(LITERT_INFO,
+             "FOLD de-CSE (NPU) p%d: split %zu multi-use constants into %zu "
+             "clones (widest fan-out %zu, limit %zu B); layer bodies should "
+             "now agree on Const count",
+             partition_idx, candidates.size(), cloned, widest, max_bytes);
+  return cloned;
 }
 
 }  // namespace litert::openvino

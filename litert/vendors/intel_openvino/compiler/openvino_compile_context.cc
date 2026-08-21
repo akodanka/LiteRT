@@ -95,6 +95,12 @@ OpenVinoCompileContext::OpenVinoCompileContext() {
         context.constant_fold_ = (value == "true");
         continue;
       }
+      if (key == "clone_shared_constants") {
+        LITERT_LOG(LITERT_INFO, "Custom config: clone_shared_constants = %s",
+                   value.c_str());
+        context.clone_shared_constants_ = (value == "true");
+        continue;
+      }
       if (key == "fuse_split_attention_to_sdpa") {
         LITERT_LOG(LITERT_INFO,
                    "Custom config: fuse_split_attention_to_sdpa = %s",
@@ -160,6 +166,10 @@ OpenVinoCompileContext::OpenVinoCompileContext() {
       }
       if (key == "constant_fold") {
         context.constant_fold_ = (value == "true");
+        continue;
+      }
+      if (key == "clone_shared_constants") {
+        context.clone_shared_constants_ = (value == "true");
         continue;
       }
       if (key == "fuse_split_attention_to_sdpa") {

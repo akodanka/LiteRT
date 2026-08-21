@@ -620,6 +620,14 @@ LiteRtStatus LiteRtCompilerPluginCompile(
         // Run NPU-specific optimization passes.
         context.OptimizeModel(ov_model);
 
+        // Split export-CSE'd constants so NPUW's FOLD match bank sees uniform
+        // layer bodies. Must precede AliasAndTagSharedConstants so the clones
+        // get aliased onto the same pool buffer (see CloneMultiUseConstants).
+        if (context.CloneSharedConstants()) {
+          litert::openvino::CloneMultiUseConstants(
+              ov_model, /*max_bytes=*/64 * 1024, partition_idx);
+        }
+
         ov::AnyMap configs = context.ConfigsMap();
         std::map<std::string, uint32_t> const_map;
         if (share_weights) {
