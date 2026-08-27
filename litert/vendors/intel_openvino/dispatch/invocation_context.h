@@ -98,8 +98,16 @@ class LiteRtDispatchInvocationContextT {
   // inputs; held for the infer request's lifetime (set_input_tensor does not
   // take ownership).
   std::vector<ov::Tensor> bound_weights_;
-  // Timeout is in milliseconds
-  static constexpr int kInferRequestTimeoutMs = 10000;
+  // Timeout is in milliseconds.
+  // NB this is a wall-clock budget on ONE infer request, and wait_for() does not
+  // cancel -- on expiry LiteRT reports failure while the NPU request keeps running
+  // to completion. So a merely-slow inference is indistinguishable from a hang
+  // here. NPUW_FOLD=YES hit exactly that: measured 2026-08-21 at 11.6 s/call
+  // (vs 0.41 s unfolded), which read as "inference stuck". Raise this to
+  // 600000 and rebuild with tools\build_litert_dispatch.bat to measure instead
+  // of guessing. Raised 2026-08-23 for the G3 FOLD row; harmless for fast rows,
+  // since it only changes what happens to a call that would otherwise be killed.
+  static constexpr int kInferRequestTimeoutMs = 600000;
 
   std::optional<LiteRtSchedulingInfo> scheduling_info_;
 };
