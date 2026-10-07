@@ -15,6 +15,7 @@
 
 #include "litert/vendors/intel_openvino/dispatch/weight_bank_runtime.h"
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
@@ -42,24 +43,161 @@
 // libstdc++'s vague-linkage std::filesystem::path symbols out of this .so,
 // where a differently-built module on the loader path (OpenVINO's libs) could
 // interpose them. MSVC / clang-cl emit COFF and have no such interposition, so
-// Windows keeps std::filesystem.
+// Windows keeps std::filesystem for temp-dir discovery and cleanup, and uses
+// CreateFile(CREATE_NEW) for the atomic create.
 #ifdef LITERT_WINDOWS_OS
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+// <windows.h> must precede the CRT headers below on some toolchains.
+#include <io.h>
+
 #include <cstdio>
 #include <filesystem>  // NOLINT
-#include <fstream>
-#include <ios>
 #include <random>
 #include <system_error>  // NOLINT
 #else
 #include <errno.h>
 #include <stdlib.h>  // mkstemp: POSIX, not declared by <cstdlib>.
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/sendfile.h>
+#endif
+#endif
+
+// copy_file_range(2): glibc >= 2.27, bionic >= API 34. Evaluated after the libc
+// headers above so __GLIBC__ / __ANDROID_API__ are visible.
+#if defined(__linux__)
+#if defined(__ANDROID__)
+#if defined(__ANDROID_API__) && __ANDROID_API__ >= 34
+#define LITERT_HAVE_COPY_FILE_RANGE 1
+#endif
+#elif defined(__GLIBC__) && \
+    (__GLIBC__ > 2 || (__GLIBC__ == 2 && __GLIBC_MINOR__ >= 27))
+#define LITERT_HAVE_COPY_FILE_RANGE 1
+#endif
+#endif
+#ifndef LITERT_HAVE_COPY_FILE_RANGE
+#define LITERT_HAVE_COPY_FILE_RANGE 0
 #endif
 
 namespace litert::openvino {
 namespace {
 
-#ifndef LITERT_WINDOWS_OS
+// Size of one user-space copy step (pointer fallback and pread/ReadFile
+// bounce buffer). Small enough that the bounce buffer is negligible next to
+// the pool, large enough to keep syscall overhead low. Also keeps every single
+// write under the 32-bit count limits of WriteFile / the MSVC CRT.
+constexpr size_t kChunkBytes = size_t{16} << 20;  // 16 MiB
+
+// Outcome of one staging attempt. |fatal| means no other strategy can succeed
+// (destination full, source shorter than the pool span, ...), so the caller
+// stops instead of falling through.
+struct CopyStatus {
+  bool ok = false;
+  bool fatal = false;
+  std::string error;  // human-readable, for logging
+};
+
+#ifdef LITERT_WINDOWS_OS
+
+std::string WinErrorString(DWORD err) {
+  char buf[256];
+  const DWORD len = ::FormatMessageA(
+      FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS, nullptr, err,
+      MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT), buf, sizeof(buf), nullptr);
+  std::string msg = len > 0 ? std::string(buf, len) : std::string();
+  while (!msg.empty() && (msg.back() == '\n' || msg.back() == '\r' ||
+                          msg.back() == ' ' || msg.back() == '.')) {
+    msg.pop_back();
+  }
+  if (msg.empty()) msg = "unknown error";
+  return msg + " (" + std::to_string(err) + ")";
+}
+
+// Chunked WriteFile of [data, data+size) at |out|'s current position. Returns
+// 0 on success, else the failing GetLastError().
+DWORD WriteAllWin(HANDLE out, const void* data, size_t size) {
+  const char* p = static_cast<const char*>(data);
+  while (size > 0) {
+    const DWORD want = static_cast<DWORD>(std::min(size, kChunkBytes));
+    DWORD wrote = 0;
+    if (!::WriteFile(out, p, want, &wrote, nullptr)) return ::GetLastError();
+    if (wrote == 0) return ERROR_WRITE_FAULT;
+    p += wrote;
+    size -= wrote;
+  }
+  return 0;
+}
+
+// Copies [in_off, in_off+size) of the model file behind |in_fd| to |out| via a
+// kChunkBytes bounce buffer. Positional reads (OVERLAPPED offset) so the copy
+// never touches the model's file mapping; the pool pages therefore never enter
+// this process's working set. The handle behind |in_fd| is dup'd from the
+// model's, and ReadFile on a synchronous handle moves the shared file pointer,
+// so it is saved and restored around the copy.
+CopyStatus CopyFdToBankWin(int in_fd, uint64_t in_off, size_t size,
+                           HANDLE out) {
+  CopyStatus st;
+  const HANDLE in = reinterpret_cast<HANDLE>(_get_osfhandle(in_fd));
+  if (in == INVALID_HANDLE_VALUE) {
+    st.error = "_get_osfhandle(" + std::to_string(in_fd) + ") failed";
+    return st;
+  }
+  LARGE_INTEGER zero{};
+  LARGE_INTEGER saved{};
+  const bool have_saved = ::SetFilePointerEx(in, zero, &saved, FILE_CURRENT);
+
+  std::vector<char> buf(kChunkBytes);
+  size_t done = 0;
+  while (done < size) {
+    const DWORD want = static_cast<DWORD>(std::min(size - done, kChunkBytes));
+    const uint64_t pos = in_off + done;
+    OVERLAPPED ov{};
+    ov.Offset = static_cast<DWORD>(pos & 0xFFFFFFFFULL);
+    ov.OffsetHigh = static_cast<DWORD>(pos >> 32);
+    DWORD got = 0;
+    if (!::ReadFile(in, buf.data(), want, &got, &ov)) {
+      const DWORD err = ::GetLastError();
+      st.fatal = (err == ERROR_HANDLE_EOF);
+      st.error = "ReadFile at offset " + std::to_string(pos) + " failed: " +
+                 WinErrorString(err);
+      break;
+    }
+    if (got == 0) {
+      st.fatal = true;
+      st.error = "model file ended at offset " + std::to_string(pos) +
+                 ", before the end of the pool span";
+      break;
+    }
+    if (const DWORD err = WriteAllWin(out, buf.data(), got); err != 0) {
+      st.fatal = true;  // destination-side; would recur on any strategy
+      st.error = "WriteFile failed: " + WinErrorString(err);
+      break;
+    }
+    done += got;
+  }
+  if (have_saved) ::SetFilePointerEx(in, saved, nullptr, FILE_BEGIN);
+  st.ok = (done == size);
+  return st;
+}
+
+#else  // POSIX
+
+#if defined(__linux__)
+using FileOff = off64_t;
+#define LITERT_PREAD ::pread64
+#define LITERT_PWRITE ::pwrite64
+#else
+using FileOff = off_t;
+#define LITERT_PREAD ::pread
+#define LITERT_PWRITE ::pwrite
+#endif
+
 // mkstemp needs the directory spelled out in its template, so mirror what
 // std::filesystem::temp_directory_path() probes. Android has no /tmp, so
 // staging there requires TMPDIR to be set -- unchanged from the previous
@@ -74,23 +212,170 @@ std::string PosixTempDir() {
   return "/tmp";
 }
 
-// A single write(2) is capped at 0x7ffff000 bytes on Linux and can be cut
-// short by a signal, so the multi-GB pool needs this loop: a short write is
-// not an error. Returns 0 on success, else the failing errno.
-int WriteAll(int fd, const void* data, size_t size) {
+// Destination-side errors recur whatever strategy is used to read the source;
+// don't waste time (or log noise) falling through on them.
+bool IsDestinationErrno(int err) {
+  switch (err) {
+    case ENOSPC:
+    case EFBIG:
+    case EIO:
+#ifdef EDQUOT
+    case EDQUOT:
+#endif
+      return true;
+    default:
+      return false;
+  }
+}
+
+// Positional, chunked write of [data, data+size) to |fd| at |offset|. A single
+// write(2) is capped at 0x7ffff000 bytes on Linux and can be cut short by a
+// signal, so the multi-GB pool needs this loop: a short write is not an error.
+// Returns 0 on success, else the failing errno.
+int PwriteAll(int fd, const void* data, size_t size, uint64_t offset) {
   const char* p = static_cast<const char*>(data);
   while (size > 0) {
-    const ssize_t written = ::write(fd, p, size);
+    const size_t want = std::min(size, kChunkBytes);
+    const ssize_t written =
+        LITERT_PWRITE(fd, p, want, static_cast<FileOff>(offset));
     if (written < 0) {
       if (errno == EINTR) continue;
       return errno;
     }
     p += written;
     size -= static_cast<size_t>(written);
+    offset += static_cast<uint64_t>(written);
   }
   return 0;
 }
-#endif  // !LITERT_WINDOWS_OS
+
+// Copies [in_off, in_off+size) of |in_fd| to [0, size) of |out_fd| without
+// faulting the model mapping: kernel-side copy_file_range, then sendfile, then
+// a pread/pwrite loop through a kChunkBytes bounce buffer. Each fallback is
+// logged with the reason. Progress carries across strategies, so a strategy
+// that fails mid-way is resumed, not restarted, by the next one. Only explicit
+// offsets are used, so the file position shared with the model's dup'd fd is
+// never moved.
+CopyStatus CopyFdToBankPosix(int in_fd, uint64_t in_off, int out_fd,
+                             size_t size, const char** strategy) {
+  CopyStatus st;
+  size_t done = 0;
+
+  auto source_truncated = [&](uint64_t pos) {
+    st.fatal = true;
+    st.error = "model file ended at offset " + std::to_string(pos) +
+               ", before the end of the pool span";
+  };
+
+#if LITERT_HAVE_COPY_FILE_RANGE
+  {
+    *strategy = "copy_file_range";
+    int err = 0;
+    while (done < size) {
+      FileOff src = static_cast<FileOff>(in_off + done);
+      FileOff dst = static_cast<FileOff>(done);
+      // Per-call count is capped by the kernel (0x7ffff000); a short copy is
+      // not an error.
+      const size_t want = std::min(size - done, size_t{1} << 30);
+      const ssize_t n = ::copy_file_range(in_fd, &src, out_fd, &dst, want, 0);
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        err = errno;
+        break;
+      }
+      if (n == 0) {
+        source_truncated(in_off + done);
+        return st;
+      }
+      done += static_cast<size_t>(n);
+    }
+    if (done == size) {
+      st.ok = true;
+      return st;
+    }
+    if (IsDestinationErrno(err)) {
+      st.fatal = true;
+      st.error = std::string("copy_file_range failed: ") + std::strerror(err);
+      return st;
+    }
+    LITERT_LOG(LITERT_WARNING,
+               "NPU weight sharing: copy_file_range failed after %zu/%zu "
+               "bytes (%s); falling back to sendfile",
+               done, size, std::strerror(err));
+  }
+#endif  // LITERT_HAVE_COPY_FILE_RANGE
+
+#if defined(__linux__)
+  {
+    *strategy = "sendfile";
+    int err = 0;
+    // sendfile writes at out_fd's file position (no out offset parameter);
+    // |out_fd| is private to this bank, so moving it is safe.
+    if (::lseek64(out_fd, static_cast<off64_t>(done), SEEK_SET) < 0) {
+      err = errno;
+    }
+    while (err == 0 && done < size) {
+      off64_t src = static_cast<off64_t>(in_off + done);
+      const size_t want = std::min(size - done, size_t{1} << 30);
+      const ssize_t n = ::sendfile64(out_fd, in_fd, &src, want);
+      if (n < 0) {
+        if (errno == EINTR) continue;
+        err = errno;
+        break;
+      }
+      if (n == 0) {
+        source_truncated(in_off + done);
+        return st;
+      }
+      done += static_cast<size_t>(n);
+    }
+    if (done == size) {
+      st.ok = true;
+      return st;
+    }
+    if (IsDestinationErrno(err)) {
+      st.fatal = true;
+      st.error = std::string("sendfile failed: ") + std::strerror(err);
+      return st;
+    }
+    LITERT_LOG(LITERT_WARNING,
+               "NPU weight sharing: sendfile failed after %zu/%zu bytes (%s); "
+               "falling back to pread/pwrite",
+               done, size, std::strerror(err));
+  }
+#endif  // __linux__
+
+  *strategy = "pread/pwrite";
+  std::vector<char> buf(kChunkBytes);
+  while (done < size) {
+    const size_t want = std::min(size - done, kChunkBytes);
+    const ssize_t n = LITERT_PREAD(in_fd, buf.data(), want,
+                                   static_cast<FileOff>(in_off + done));
+    if (n < 0) {
+      if (errno == EINTR) continue;
+      st.error = std::string("pread failed: ") + std::strerror(errno);
+      return st;
+    }
+    if (n == 0) {
+      source_truncated(in_off + done);
+      return st;
+    }
+    if (const int err = PwriteAll(out_fd, buf.data(), static_cast<size_t>(n),
+                                  done);
+        err != 0) {
+      st.fatal = IsDestinationErrno(err);
+      st.error = std::string("pwrite failed: ") + std::strerror(err);
+      return st;
+    }
+    done += static_cast<size_t>(n);
+  }
+  st.ok = true;
+  return st;
+}
+
+#undef LITERT_PREAD
+#undef LITERT_PWRITE
+#endif  // LITERT_WINDOWS_OS
 
 }  // namespace
 
@@ -183,9 +468,12 @@ std::string NpuSharedBank::Path() const {
   return bank_path_;
 }
 
-std::string NpuSharedBank::EnsureOnDisk(const void* data, size_t size) {
+std::string NpuSharedBank::EnsureOnDisk(const PoolSource& src) {
   absl::MutexLock lock(npu_bank_mutex_);
   if (!bank_path_.empty()) return bank_path_;  // write once, reuse
+
+  const void* data = src.data;
+  const size_t size = src.size;
 
   // Guard against a null/empty pool: writing 0 bytes yields an empty file that
   // NPUW would mmap to a zero-length region, so data()+bin_offset is undefined.
@@ -207,6 +495,19 @@ std::string NpuSharedBank::EnsureOnDisk(const void* data, size_t size) {
     return bank_path_;
   }
 
+  // Prefer copying from the model file itself: that never touches the model's
+  // mapping, so the pool pages never become resident in this process. Without
+  // an fd the only source is the in-memory view, which faults every page of
+  // the pool into the model mapping for the lifetime of the LiteRtModel.
+  const bool have_fd = src.fd >= 0;
+  if (!have_fd) {
+    LITERT_LOG(LITERT_WARNING,
+               "NPU weight sharing: model is not file-backed (fd=%d); staging "
+               "%zu-byte pool from memory, which faults it into RSS",
+               src.fd, size);
+  }
+  const char* strategy = "write(ptr)";
+
 #ifdef LITERT_WINDOWS_OS
   std::error_code ec;
   const std::filesystem::path tmp_dir =
@@ -219,40 +520,77 @@ std::string NpuSharedBank::EnsureOnDisk(const void* data, size_t size) {
   }
 
   // No mkstemp on Windows; probe random names in the system temp dir.
+  // CREATE_NEW makes the probe atomic (fails with ERROR_FILE_EXISTS rather
+  // than clobbering a concurrently created file).
   std::random_device rd;  // NOLINT
   std::filesystem::path file_path;
-  bool found = false;
-  for (int attempt = 0; attempt < 64; ++attempt) {
+  HANDLE out = INVALID_HANDLE_VALUE;
+  for (int attempt = 0; attempt < 64 && out == INVALID_HANDLE_VALUE;
+       ++attempt) {
     const uint64_t r =
         (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
     char name[40];
     std::snprintf(name, sizeof(name), "litert_ov_bank_%016llx.bin",
                   static_cast<unsigned long long>(r));
     file_path = tmp_dir / name;
-    if (!std::filesystem::exists(file_path, ec)) {
-      found = true;
-      break;
+    out = ::CreateFileW(file_path.c_str(), GENERIC_WRITE, /*dwShareMode=*/0,
+                        /*lpSecurityAttributes=*/nullptr, CREATE_NEW,
+                        FILE_ATTRIBUTE_NORMAL, /*hTemplateFile=*/nullptr);
+    if (out == INVALID_HANDLE_VALUE) {
+      const DWORD err = ::GetLastError();
+      if (err != ERROR_FILE_EXISTS) {
+        LITERT_LOG(LITERT_ERROR,
+                   "NPU weight sharing: failed to create temp file '%s': %s",
+                   file_path.string().c_str(), WinErrorString(err).c_str());
+        return {};
+      }
     }
   }
-  if (!found) {
+  if (out == INVALID_HANDLE_VALUE) {
     LITERT_LOG(LITERT_ERROR,
                "NPU weight sharing: could not find a free temp file name");
     return {};
   }
 
-  std::ofstream out(file_path, std::ios::binary | std::ios::trunc);
-  if (!out) {
-    LITERT_LOG(LITERT_ERROR,
-               "NPU weight sharing: failed to open temp file '%s'",
-               file_path.string().c_str());
-    return {};
+  CopyStatus st;
+  if (have_fd) {
+    strategy = "ReadFile/WriteFile";
+    st = CopyFdToBankWin(src.fd, src.file_offset, size, out);
+    if (!st.ok && !st.fatal) {
+      LITERT_LOG(LITERT_WARNING,
+                 "NPU weight sharing: fd copy (%s) failed: %s; falling back "
+                 "to staging from memory, which faults the pool into RSS",
+                 strategy, st.error.c_str());
+      // Restart from byte 0: the pointer path rewrites the whole file.
+      LARGE_INTEGER zero{};
+      if (!::SetFilePointerEx(out, zero, nullptr, FILE_BEGIN) ||
+          !::SetEndOfFile(out)) {
+        st.fatal = true;
+        st.error = "failed to rewind temp file: " +
+                   WinErrorString(::GetLastError());
+      }
+    }
   }
-  out.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
-  out.close();
-  if (!out) {
+  if (!st.ok && !st.fatal) {
+    strategy = "write(ptr)";
+    if (const DWORD err = WriteAllWin(out, data, size); err != 0) {
+      st.error = "WriteFile failed: " + WinErrorString(err);
+    } else {
+      st.ok = true;
+    }
+  }
+  // Treat a close error as a write error: flush failures can surface only
+  // here.
+  if (st.ok && !::CloseHandle(out)) {
+    st.ok = false;
+    st.error = "CloseHandle failed: " + WinErrorString(::GetLastError());
+  } else if (!st.ok) {
+    ::CloseHandle(out);
+  }
+  if (!st.ok) {
     LITERT_LOG(LITERT_ERROR,
-               "NPU weight sharing: failed to write temp file '%s'",
-               file_path.string().c_str());
+               "NPU weight sharing: failed to write temp file '%s' via %s: %s",
+               file_path.string().c_str(), strategy, st.error.c_str());
     std::filesystem::remove(file_path, ec);
     return {};
   }
@@ -277,15 +615,40 @@ std::string NpuSharedBank::EnsureOnDisk(const void* data, size_t size) {
   }
   const std::string file_path(path_buf.data());
 
-  const int write_err = WriteAll(fd, data, size);
-  // Close even when the write failed, and treat a close error as a write
+  CopyStatus st;
+  if (have_fd) {
+    st = CopyFdToBankPosix(src.fd, src.file_offset, fd, size, &strategy);
+    if (!st.ok && !st.fatal) {
+      LITERT_LOG(LITERT_WARNING,
+                 "NPU weight sharing: fd copy (%s) failed: %s; falling back "
+                 "to staging from memory, which faults the pool into RSS",
+                 strategy, st.error.c_str());
+      // Restart from byte 0: the pointer path rewrites the whole file.
+      if (::ftruncate(fd, 0) != 0) {
+        st.fatal = true;
+        st.error =
+            std::string("ftruncate failed: ") + std::strerror(errno);
+      }
+    }
+  }
+  if (!st.ok && !st.fatal) {
+    strategy = "write(ptr)";
+    if (const int err = PwriteAll(fd, data, size, /*offset=*/0); err != 0) {
+      st.error = std::string("pwrite failed: ") + std::strerror(err);
+    } else {
+      st.ok = true;
+    }
+  }
+  // Close even when the copy failed, and treat a close error as a write
   // error: ENOSPC / EIO can surface only here.
-  const int close_err = (::close(fd) == 0) ? 0 : errno;
-  if (write_err != 0 || close_err != 0) {
+  if (::close(fd) != 0 && st.ok) {
+    st.ok = false;
+    st.error = std::string("close failed: ") + std::strerror(errno);
+  }
+  if (!st.ok) {
     LITERT_LOG(LITERT_ERROR,
-               "NPU weight sharing: failed to write temp file '%s': %s",
-               file_path.c_str(),
-               std::strerror(write_err != 0 ? write_err : close_err));
+               "NPU weight sharing: failed to write temp file '%s' via %s: %s",
+               file_path.c_str(), strategy, st.error.c_str());
     ::unlink(file_path.c_str());
     return {};
   }
@@ -294,8 +657,11 @@ std::string NpuSharedBank::EnsureOnDisk(const void* data, size_t size) {
 #endif  // LITERT_WINDOWS_OS
   owns_bank_file_ = true;
   LITERT_LOG(LITERT_INFO,
-             "NPU weight sharing: staged %zu-byte weights bank to '%s'", size,
-             bank_path_.c_str());
+             "NPU weight sharing: staged %zu-byte weights bank to '%s' via %s "
+             "(source: %s, file offset %llu)",
+             size, bank_path_.c_str(), strategy,
+             have_fd ? "model fd" : "memory",
+             static_cast<unsigned long long>(have_fd ? src.file_offset : 0));
   return bank_path_;
 }
 

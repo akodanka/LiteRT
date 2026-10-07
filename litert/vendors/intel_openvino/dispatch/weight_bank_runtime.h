@@ -75,6 +75,20 @@ class GpuSharedBank {
   bool bank_ready_ ABSL_GUARDED_BY(gpu_bank_mutex_) = false;
 };
 
+// Where a model's weight pool bytes come from. |data|/|size| are always set:
+// the in-memory view of the pool the caller has already bounds-checked. When
+// the model is file-backed, |fd| is the model file descriptor and
+// |file_offset| the pool's absolute byte offset in it; staging then copies
+// fd->fd (kernel-side where the platform allows) so the multi-GB pool is never
+// faulted into this process through the model mapping. With |fd| < 0 (model
+// loaded from a heap buffer) staging falls back to writing from |data|.
+struct PoolSource {
+  const void* data = nullptr;
+  size_t size = 0;
+  int fd = -1;
+  uint64_t file_offset = 0;
+};
+
 // One on-disk copy of a model's deduplicated weight pool, owned by the model's
 // device context (so it is staged once and shared by the prefill and decode
 // partitions, but distinct across models -- a process-wide bank would hand the
@@ -90,12 +104,15 @@ class NpuSharedBank {
   NpuSharedBank(NpuSharedBank&&) = delete;
   NpuSharedBank& operator=(NpuSharedBank&&) = delete;
 
-  // Stages the pool [data, data+size) to a temp file and returns its path
+  // Stages the pool described by |src| to a temp file and returns its path
   // (empty on failure). Thread-safe and write-once: later calls return the
   // cached path, ignoring their arguments, so the multi-GB pool is written
   // once. Portable across Windows / Linux / Android: POSIX targets stage with
-  // mkstemp, Windows with std::filesystem.
-  std::string EnsureOnDisk(const void* data, size_t size);
+  // mkstemp, Windows with CreateFile(CREATE_NEW). Copy strategy, in order of
+  // preference, each fallback logged: copy_file_range -> sendfile ->
+  // pread/pwrite (Linux/Android), positional ReadFile/WriteFile (Windows),
+  // then chunked writes from |src.data| when no fd is available.
+  std::string EnsureOnDisk(const PoolSource& src);
 
   // The cached bank path, or empty if EnsureOnDisk has not yet succeeded.
   std::string Path() const;

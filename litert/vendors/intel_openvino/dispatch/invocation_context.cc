@@ -159,9 +159,11 @@ LiteRtDispatchInvocationContextT::Create(
   // to the graph name; fall back to the sole subgraph). The subgraph's weights
   // are resolved against the pool at import below:
   //   - GPU: bound as views into a shared USM-host copy of the pool.
-  //   - NPU: the pool is staged to a temp file and handed to NPUW via
-  //     ov::weights_path; each Constant's WeightlessCacheAttribute bin_offset
-  //     resolves to mmap->data() + bin_offset.
+  //   - NPU: the pool is staged to a temp file (copied fd->fd from the model
+  //     file when it is file-backed, so the pool is never faulted into this
+  //     process) and handed to NPUW via ov::weights_path; each Constant's
+  //     WeightlessCacheAttribute bin_offset resolves to mmap->data() +
+  //     bin_offset.
   // Non-shared models skip this and use the raw bytecode directly.
   // |global_graph| is kept at function scope (its spans alias
   // exec_bytecode_buffer, which outlives this function) so the GPU bank fill
@@ -347,9 +349,25 @@ LiteRtDispatchInvocationContextT::Create(
     if (npu_shared) {
       // Stage the deduplicated pool to a temp file once per model, then hand it
       // to NPUW. The temp file is a byte-for-byte copy of the contiguous pool
-      // span, starting at byte 0, so bin_offset resolves directly.
+      // span, starting at byte 0, so bin_offset resolves directly. When the
+      // model is file-backed (fd >= 0) the bank copies fd->fd from the pool's
+      // absolute file offset, so the multi-GB pool is never faulted into this
+      // process through the model mapping; otherwise it falls back to the
+      // in-memory view (logged by the bank).
+      litert::openvino::PoolSource pool_source;
+      pool_source.data = pool_ptr;
+      pool_source.size = pool_size;
+      if (exec_bytecode_buffer->fd >= 0) {
+        const auto* buf_base =
+            static_cast<const uint8_t*>(exec_bytecode_buffer->base_addr);
+        pool_source.fd = exec_bytecode_buffer->fd;
+        pool_source.file_offset =
+            static_cast<uint64_t>(
+                exec_bytecode_buffer->alloc_base_file_offset) +
+            static_cast<uint64_t>(pool_ptr - buf_base);
+      }
       const std::string bank_path =
-          device_context.NpuBank().EnsureOnDisk(pool_ptr, pool_size);
+          device_context.NpuBank().EnsureOnDisk(pool_source);
       if (bank_path.empty()) {
         return litert::Error(
             kLiteRtStatusErrorRuntimeFailure,
