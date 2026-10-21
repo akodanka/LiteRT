@@ -16,12 +16,15 @@
 #ifndef ODML_LITERT_LITERT_VENDORS_OPENVINO_DISPATCH_LITERT_DISPATCH_INVOCATION_CONTEXT_H_
 #define ODML_LITERT_LITERT_VENDORS_OPENVINO_DISPATCH_LITERT_DISPATCH_INVOCATION_CONTEXT_H_
 
+#include <cstddef>
 #include <optional>
 #include <utility>
 #include <vector>
 
+#include "openvino/runtime/compiled_model.hpp"
 #include "openvino/runtime/infer_request.hpp"
 #include "openvino/runtime/tensor.hpp"
+#include "openvino/runtime/variable_state.hpp"
 #include "litert/c/internal/litert_scheduling_info.h"
 #include "litert/c/litert_common.h"
 #include "litert/c/litert_model_types.h"
@@ -85,19 +88,36 @@ class LiteRtDispatchInvocationContextT {
   }
 
  private:
-  LiteRtDispatchInvocationContextT(ov::InferRequest& infer_request,
-                                   LiteRtDispatchDeviceContextT& device_context,
-                                   int num_inputs, int num_outputs,
-                                   std::vector<ov::Tensor> bound_weights = {})
+  // Where NPUW's HFA history comes from on a prefill graph: the input holding
+  // its attention mask, and the request's npuw_history_size state it is
+  // written to before every inference (see hfa_history.h).
+  struct HfaHistory {
+    size_t mask_input_index;
+    ov::VariableState state;
+  };
+
+  LiteRtDispatchInvocationContextT(
+      ov::InferRequest& infer_request,
+      LiteRtDispatchDeviceContextT& device_context, int num_inputs,
+      int num_outputs, std::vector<ov::Tensor> bound_weights = {},
+      std::optional<HfaHistory> hfa_history = std::nullopt)
       : device_context_(device_context),
         infer_request_(infer_request),
-        bound_weights_(std::move(bound_weights)) {}
+        bound_weights_(std::move(bound_weights)),
+        hfa_history_(std::move(hfa_history)) {}
+
+  static std::optional<HfaHistory> FindHfaHistory(
+      const ov::CompiledModel& compiled_model, ov::InferRequest& infer_request,
+      const char* partition_name);
+  litert::Expected<void> UpdateHfaHistory();
+
   LiteRtDispatchDeviceContextT& device_context_;
   ov::InferRequest infer_request_;
   // Views into the shared usm-host weight buffer bound to weight-Parameter
   // inputs; held for the infer request's lifetime (set_input_tensor does not
   // take ownership).
   std::vector<ov::Tensor> bound_weights_;
+  std::optional<HfaHistory> hfa_history_;
   // Timeout is in milliseconds
   static constexpr int kInferRequestTimeoutMs = 10000;
 

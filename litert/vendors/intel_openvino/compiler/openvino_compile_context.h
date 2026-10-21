@@ -67,9 +67,8 @@ class OpenVinoCompileContext {
   // WeightlessCacheAttribute bin_offset rather than baked in).
   // |result| (from OptimizeModel) selects the NPUW pipeline: a multi-token
   // MoE chunk gets the host-router/REP pipeline, anything else gets the plain
-  // CWAI pipeline. A graph whose prefill SDPAs were decomposed for HFA
-  // ("enable_hfa") also gets NPUW_ATTN=HFA, unless NPUW_ATTN was set
-  // explicitly.
+  // CWAI pipeline. A graph with SDPAs decomposed for HFA also gets
+  // NPUW_ATTN=HFA unless NPUW_ATTN was set explicitly.
   void ConfigureForNpuWeightSharing(const OptimizeModelResult& result);
 
   // Runs NPU-specific optimization passes on the given OV model.
@@ -89,9 +88,8 @@ class OpenVinoCompileContext {
   bool eliminate_fq_after_matmul_ = false;
   bool fuse_split_attention_to_sdpa_ = false;
 
-  // Enables Host Flash Attention on the prefill graphs: turns on the SDPA
-  // fusion, the GQA unfold and DecomposeSDPAForHFA (which rewrites only
-  // multi-token SDPAs), and sets NPUW_ATTN=HFA on the graphs that pass
+  // Enables Host Flash Attention on the prefill graphs: the SDPA fusion, the
+  // GQA unfold and DecomposeSDPAForHFA, plus NPUW_ATTN=HFA on the graphs it
   // rewrote. Set via config "enable_hfa".
   bool enable_hfa_ = false;
 

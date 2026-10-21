@@ -34,6 +34,7 @@
 #include "openvino/core/any.hpp"
 #include "openvino/runtime/compiled_model.hpp"
 #include "openvino/runtime/tensor.hpp"
+#include "openvino/runtime/variable_state.hpp"
 #if defined(__ANDROID__)
 #include <unistd.h>
 #include "litert/vendors/intel_openvino/dispatch/npu_hal_wrapper.h"
@@ -54,6 +55,7 @@
 #include "litert/vendors/intel_openvino/bytecode_header.h"
 #include "litert/vendors/intel_openvino/compiler/global_graph.h"
 #include "litert/vendors/intel_openvino/dispatch/weight_bank_runtime.h"
+#include "litert/vendors/intel_openvino/hfa_history.h"
 #include "litert/vendors/intel_openvino/openvino_version_info.h"
 
 namespace {
@@ -422,11 +424,84 @@ LiteRtDispatchInvocationContextT::Create(
                bound_weights.size());
   }
 
+  auto hfa_history =
+      FindHfaHistory(compiled_model, infer_request, partition_name);
+
   LITERT_LOG(LITERT_INFO, "Openvino InvocationContext Initialize SUCCESS");
   // TODO: add support for loading cached model
-  return Ptr(new LiteRtDispatchInvocationContextT(infer_request, device_context,
-                                                  num_inputs, num_outputs,
-                                                  std::move(bound_weights)));
+  return Ptr(new LiteRtDispatchInvocationContextT(
+      infer_request, device_context, num_inputs, num_outputs,
+      std::move(bound_weights), std::move(hfa_history)));
+}
+
+std::optional<LiteRtDispatchInvocationContextT::HfaHistory>
+LiteRtDispatchInvocationContextT::FindHfaHistory(
+    const ov::CompiledModel& compiled_model, ov::InferRequest& infer_request,
+    const char* partition_name) {
+  // Only graphs whose prefill attention enable_hfa decomposed carry the tag.
+  const auto inputs = compiled_model.inputs();
+  const auto mask = std::find_if(
+      inputs.begin(), inputs.end(), [](const ov::Output<const ov::Node>& in) {
+        return in.get_names().count(
+                   litert::openvino::kHfaHistoryMaskTensorName) > 0;
+      });
+  if (mask == inputs.end()) return std::nullopt;
+  const size_t index = static_cast<size_t>(mask - inputs.begin());
+  if (mask->get_partial_shape().is_dynamic()) {
+    LITERT_LOG(LITERT_WARNING,
+               "HFA: partition '%s' input %zu has a dynamic shape, not "
+               "reporting the history to NPUW",
+               partition_name, index);
+    return std::nullopt;
+  }
+  if (auto valid = litert::openvino::CheckHistoryMask(mask->get_element_type(),
+                                                      mask->get_shape());
+      !valid.HasValue()) {
+    LITERT_LOG(LITERT_WARNING,
+               "HFA: partition '%s' input %zu, not reporting the history to "
+               "NPUW: %s",
+               partition_name, index, valid.Error().Message().c_str());
+    return std::nullopt;
+  }
+  try {
+    for (auto& state : infer_request.query_state()) {
+      if (state.get_name() == litert::openvino::kNpuwHistorySizeStateName) {
+        LITERT_LOG(LITERT_INFO,
+                   "HFA: partition '%s' reports the history to NPUW, read "
+                   "from input %zu %s",
+                   partition_name, index,
+                   mask->get_shape().to_string().c_str());
+        return HfaHistory{index, state};
+      }
+    }
+  } catch (const std::exception& e) {
+    LITERT_LOG(LITERT_WARNING, "HFA: query_state() failed: %s", e.what());
+    return std::nullopt;
+  }
+  LITERT_LOG(LITERT_WARNING,
+             "HFA: partition '%s' has an HFA mask, but the OpenVINO NPU "
+             "plugin does not expose the %s state",
+             partition_name, litert::openvino::kNpuwHistorySizeStateName);
+  return std::nullopt;
+}
+
+litert::Expected<void> LiteRtDispatchInvocationContextT::UpdateHfaHistory() {
+  LITERT_ASSIGN_OR_RETURN(
+      const int64_t history,
+      litert::openvino::HistorySizeFromMask(
+          infer_request_.get_input_tensor(hfa_history_->mask_input_index)));
+  try {
+    ov::Tensor value(ov::element::i64, ov::Shape{1});
+    value.data<int64_t>()[0] = history;
+    hfa_history_->state.set_state(value);
+  } catch (const std::exception& e) {
+    return litert::Unexpected(
+        kLiteRtStatusErrorRuntimeFailure,
+        std::string("Failed to set the HFA history: ") + e.what());
+  }
+  LITERT_LOG(LITERT_DEBUG, "HFA: history %lld",
+             static_cast<long long>(history));
+  return {};
 }
 
 litert::Expected<LiteRtTensorBufferRequirements>
@@ -497,6 +572,9 @@ struct ov_infer_request_wrapper {
 };
 
 litert::Expected<void> LiteRtDispatchInvocationContextT::Invoke() {
+  if (hfa_history_) {
+    LITERT_RETURN_IF_ERROR(UpdateHfaHistory());
+  }
 #if defined(__ANDROID__)
   const LiteRtSchedulingInfo* scheduling_info = GetSchedulingInfo();
   const bool has_job_priority =

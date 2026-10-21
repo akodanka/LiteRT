@@ -44,6 +44,7 @@ litert_lib(
     deps = [
         ":weight_bank_attributes",
         "//litert/c/internal:litert_logging",
+        "//litert/vendors/intel_openvino:hfa_history",
         "@intel_openvino//:openvino",
     ],
 )
@@ -60,6 +61,7 @@ litert_test(
     ],
     deps = [
         ":npu_optimizer",
+        "//litert/vendors/intel_openvino:hfa_history",
         "@intel_openvino//:openvino",
     ],
 )

@@ -14,6 +14,7 @@
 # limitations under the License.
 
 load("@rules_cc//cc:cc_library.bzl", "cc_library")
+load("//litert/build_common:litert_build_defs.bzl", "litert_test")
 
 # copybara:uncomment_begin(google-only)
 # load("//tools/build_defs/build_test:build_test.bzl", "build_test")
@@ -65,6 +66,40 @@ cc_library(
         "//litert/c/internal:litert_logging",
         "@com_google_absl//absl/strings",
         "@com_google_absl//absl/synchronization",
+        "@intel_openvino//:openvino",
+    ],
+)
+
+# Reads the HFA history (tokens already in the KV cache) from a prefill
+# graph's attention mask for NPUW; shared by the compiler and dispatch.
+cc_library(
+    name = "hfa_history",
+    srcs = ["hfa_history.cc"],
+    hdrs = ["hfa_history.h"],
+    copts = select({
+        "//litert/runtime/dispatch:windows_msvc": ["/EHsc"],
+        "//conditions:default": ["-fexceptions"],
+    }),
+    features = ["-use_header_modules"],  # Incompatible with -fexceptions.
+    deps = [
+        "//litert/c:litert_common",
+        "//litert/cc:litert_expected",
+        "@intel_openvino//:openvino",
+    ],
+)
+
+litert_test(
+    name = "hfa_history_test",
+    srcs = ["hfa_history_test.cc"],
+    copts = ["-fexceptions"],
+    features = ["-use_header_modules"],  # Incompatible with -fexceptions.
+    tags = [
+        "manual",
+        "nobuilder",
+        "notap",
+    ],
+    deps = [
+        ":hfa_history",
         "@intel_openvino//:openvino",
     ],
 )

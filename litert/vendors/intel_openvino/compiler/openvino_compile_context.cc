@@ -240,8 +240,7 @@ void OpenVinoCompileContext::ConfigureForNpuWeightSharing(
              "chunk pipeline)",
              moe_multi_token_chunk ? "multi-token" : "single-token");
 
-  // Ask NPUW for HFA on exactly the graphs whose prefill SDPAs were
-  // decomposed into the form it converts. An explicit NPUW_ATTN wins.
+  // Set NPUW_ATTN=HFA on graphs with decomposed SDPAs unless already set.
   if (result.num_sdpa_decomposed_for_hfa > 0 &&
       configs_map_.try_emplace("NPUW_ATTN", std::string("HFA")).second) {
     LITERT_LOG(LITERT_INFO,
@@ -255,7 +254,7 @@ void OpenVinoCompileContext::ConfigureForNpuWeightSharing(
                  "attach HFA");
     }
   }
-  // HFA converts only the decomposed form, which enable_hfa produces.
+  // HFA converts only the decomposed form that enable_hfa produces.
   const auto attn = configs_map_.find("NPUW_ATTN");
   if (!enable_hfa_ && attn != configs_map_.end() &&
       attn->second.as<std::string>() == "HFA") {
@@ -269,8 +268,7 @@ OpenVinoCompileContext::OptimizeModelResult
 OpenVinoCompileContext::OptimizeModel(
     const std::shared_ptr<ov::Model>& model) const {
   if (device_ != "NPU") return {};
-  // HFA is built on the fused, head-parallel SDPA, so enable_hfa implies the
-  // fusion and the GQA unfold.
+  // enable_hfa implies the SDPA fusion and the GQA unfold.
   const NpuOptimizer::Result result =
       NpuOptimizer()
           .SetConstantFold(true)
