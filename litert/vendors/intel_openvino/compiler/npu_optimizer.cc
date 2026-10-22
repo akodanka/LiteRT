@@ -226,8 +226,16 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
       return false;
     }
 
+    // An fp16 export runs the mask add and the softmax in f32 between two
+    // Converts; look through them.
+    auto skip_convert = [](const ov::Output<ov::Node>& out) {
+      const auto node = out.get_node_shared_ptr();
+      return ov::is_type<ov::op::v0::Convert>(node) ? node->input_value(0)
+                                                    : out;
+    };
+
     // Both V matmuls' first input must be a Slice / StridedSlice over a
-    // common Softmax.
+    // common Softmax (optionally through a Convert).
     auto cache_src_node = v_matmul_cache->input_value(0).get_node_shared_ptr();
     auto new_src_node = v_matmul_new->input_value(0).get_node_shared_ptr();
     const bool cache_is_slice =
@@ -240,9 +248,9 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
       return false;
     }
     auto sm_cache = std::dynamic_pointer_cast<ov::op::v8::Softmax>(
-        cache_src_node->input_value(0).get_node_shared_ptr());
+        skip_convert(cache_src_node->input_value(0)).get_node_shared_ptr());
     auto sm_new = std::dynamic_pointer_cast<ov::op::v8::Softmax>(
-        new_src_node->input_value(0).get_node_shared_ptr());
+        skip_convert(new_src_node->input_value(0)).get_node_shared_ptr());
     if (!sm_cache || sm_cache != sm_new) {
       LITERT_LOG(LITERT_DEBUG,
                  "FuseSplitAttentionToSDPA[%s]: reject: slices do not share a "
@@ -264,14 +272,67 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
       return false;
     }
 
-    auto mask_add_node = std::dynamic_pointer_cast<ov::op::v1::Add>(
-        softmax_node->input_value(0).get_node_shared_ptr());
-    if (!mask_add_node) {
-      return false;
+    // The scores are masked in one of two forms:
+    //   Add(Concat, mask)                              mask [1,1,r*S,KV] or
+    //                                                  broadcastable to it
+    //   Reshape(Add([Convert](Reshape5(Concat)), Reshape5(mask)))
+    //       the scores [1,H,r*S,KV] viewed as [1,H,r,S,KV] and a [1,1,S,KV]
+    //       mask broadcast over the r GQA groups as [1,1,1,S,KV].
+    // The second is rewritten to the first's r-way tiled mask, the form
+    // UnfoldGqaSequenceFold undoes.
+    auto static_shape = [](const ov::Output<ov::Node>& out,
+                           int64_t rank) -> std::optional<ov::Shape> {
+      const auto& ps = out.get_partial_shape();
+      if (ps.is_dynamic() || ps.rank().get_length() != rank) {
+        return std::nullopt;
+      }
+      return ps.to_shape();
+    };
+    std::shared_ptr<ov::Node> scores_node;
+    ov::Output<ov::Node> mask_value;
+    int64_t mask_groups = 1;  // > 1: tile the mask this many times on axis 2
+    if (auto unview = std::dynamic_pointer_cast<ov::op::v1::Reshape>(
+            softmax_node->input_value(0).get_node_shared_ptr())) {
+      auto add5 = std::dynamic_pointer_cast<ov::op::v1::Add>(
+          unview->input_value(0).get_node_shared_ptr());
+      if (!add5) return false;
+      auto scores5 = std::dynamic_pointer_cast<ov::op::v1::Reshape>(
+          skip_convert(add5->input_value(0)).get_node_shared_ptr());
+      auto mask5 = std::dynamic_pointer_cast<ov::op::v1::Reshape>(
+          add5->input_value(1).get_node_shared_ptr());
+      if (!scores5 || !mask5) return false;
+      const auto s4 = static_shape(scores5->input_value(0), 4);
+      const auto s5 = static_shape(scores5->output(0), 5);
+      const auto m4 = static_shape(mask5->input_value(0), 4);
+      const auto m5 = static_shape(mask5->output(0), 5);
+      const auto back = static_shape(unview->output(0), 4);
+      if (!s4 || !s5 || !m4 || !m5 || !back || *back != *s4) return false;
+      const ov::Shape& s = *s5;  // [1,H,r,S,KV]
+      if (s[0] != 1 || (*s4)[0] != 1 || (*s4)[1] != s[1] ||
+          (*s4)[2] != s[2] * s[3] || (*s4)[3] != s[4] ||
+          *m4 != ov::Shape{1, 1, s[3], s[4]} ||
+          *m5 != ov::Shape{1, 1, 1, s[3], s[4]}) {
+        LITERT_LOG(LITERT_DEBUG,
+                   "FuseSplitAttentionToSDPA[%s]: reject: 5-D masked scores "
+                   "are not a [1,H,r,S,KV] view with a [1,1,1,S,KV] mask",
+                   root_name.c_str());
+        return false;
+      }
+      scores_node = scores5->input_value(0).get_node_shared_ptr();
+      mask_value = mask5->input_value(0);
+      mask_groups = static_cast<int64_t>(s[2]);
+    } else {
+      auto mask_add_node = std::dynamic_pointer_cast<ov::op::v1::Add>(
+          softmax_node->input_value(0).get_node_shared_ptr());
+      if (!mask_add_node) {
+        return false;
+      }
+      scores_node = mask_add_node->input_value(0).get_node_shared_ptr();
+      mask_value = mask_add_node->input_value(1);
     }
 
-    auto concat_node = std::dynamic_pointer_cast<ov::op::v0::Concat>(
-        mask_add_node->input_value(0).get_node_shared_ptr());
+    auto concat_node =
+        std::dynamic_pointer_cast<ov::op::v0::Concat>(scores_node);
     if (!concat_node || concat_node->get_input_size() != 2) {
       return false;
     }
@@ -325,7 +386,6 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
     auto k_new = qk_new_node->input_value(1);
     auto v_cache = v_matmul_cache->input_value(1);
     auto v_new = v_matmul_new->input_value(1);
-    auto mask_value = mask_add_node->input_value(1);
 
     // KV-cache sharing guard: K_cache / V_cache must each feed exactly one
     // consumer (the QK / attn*V MatMul we are about to fuse). If the same KV
@@ -401,6 +461,24 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
       return false;
     }
 
+    // The new K/V slice is also a graph output (the cache update). In an fp16
+    // export the frontend's TransposeSinking leaves it as a Convert shared by
+    // that Result and this attention. NPUW isolates a KV Concat's Convert
+    // inputs into the attention block while the producing block keeps the
+    // Result's Convert, so one shared Convert would sit in two blocks (NPUW:
+    // "Model references undeclared parameters"). Give the Concat its own copy.
+    ov::NodeVector new_nodes;
+    auto private_convert = [&new_nodes](const ov::Output<ov::Node>& in) {
+      auto convert =
+          std::dynamic_pointer_cast<ov::op::v0::Convert>(in.get_node_shared_ptr());
+      if (!convert || HasSingleConsumer(in)) return in;
+      auto copy = convert->clone_with_new_inputs({convert->input_value(0)});
+      new_nodes.push_back(copy);
+      return copy->output(0);
+    };
+    k_new = private_convert(k_new);
+    v_new = private_convert(v_new);
+
     auto k_concat = std::make_shared<ov::op::v0::Concat>(
         ov::OutputVector{k_cache, k_new}, k_concat_axis);
     auto v_concat = std::make_shared<ov::op::v0::Concat>(
@@ -409,7 +487,7 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
     std::shared_ptr<ov::Node> k_input = k_concat;
     std::shared_ptr<ov::Node> v_input = v_concat;
 
-    ov::NodeVector new_nodes{k_concat, v_concat};
+    new_nodes.insert(new_nodes.end(), {k_concat, v_concat});
     auto add_transpose = [&new_nodes](std::shared_ptr<ov::Node>& target) {
       auto perm = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4},
                                                {0, 1, 3, 2});
@@ -434,6 +512,23 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
     if (kv_pad > 0) {
       new_nodes.push_back(key_out.get_node_shared_ptr());
       new_nodes.push_back(val_out.get_node_shared_ptr());
+    }
+
+    // SDPA takes an additive mask of Q's type (the f32 mask of an fp16
+    // export; -100 is exact in f16). Convert before tiling so the tile stays
+    // a Concat of one source.
+    if (mask_value.get_element_type() != q.get_element_type()) {
+      auto convert = std::make_shared<ov::op::v0::Convert>(
+          mask_value, q.get_element_type());
+      new_nodes.push_back(convert);
+      mask_value = convert->output(0);
+    }
+    if (mask_groups > 1) {
+      auto tiled = std::make_shared<ov::op::v0::Concat>(
+          ov::OutputVector(static_cast<size_t>(mask_groups), mask_value),
+          /*axis=*/2);
+      new_nodes.push_back(tiled);
+      mask_value = tiled->output(0);
     }
 
     // Mask. Its KV axis (-1) must match the (possibly padded) KV length, so
@@ -1778,12 +1873,81 @@ bool IsSingleTokenGqaFoldReshape(const std::shared_ptr<ov::Node>& node) {
          (*out)[2] == hq / hkv;
 }
 
+// NPUW's HFA ends the attention block (MatMul -> Transpose -> Reshape) with a
+// [B,S,H*D] output. An export that merges the heads straight into [B*S,H*D]
+// would leave the block's real output shaped unlike HFA's, which the NPU
+// rejects at the first infer ("got [1,1024,4096] expecting [1024,4096]").
+// So when |pv| ([B,H,S,D]) feeds only Transpose(0,2,1,3) -> Reshape to some
+// other shape, route it through a Reshape to [B,S,H*D] first.
+void InsertHeadMergeReshape(const std::shared_ptr<ov::Node>& pv) {
+  auto only_consumer = [](const ov::Output<ov::Node>& out) {
+    return HasSingleConsumer(out)
+               ? out.get_target_inputs().begin()->get_node()->shared_from_this()
+               : nullptr;
+  };
+  auto transpose =
+      std::dynamic_pointer_cast<ov::op::v1::Transpose>(only_consumer(pv->output(0)));
+  if (!transpose) return;
+  auto order = std::dynamic_pointer_cast<ov::op::v0::Constant>(
+      transpose->get_input_node_shared_ptr(1));
+  if (!order || order->cast_vector<int64_t>() != std::vector<int64_t>{0, 2, 1, 3}) {
+    return;
+  }
+  auto reshape = std::dynamic_pointer_cast<ov::op::v1::Reshape>(
+      only_consumer(transpose->output(0)));
+  const auto merged_from = StaticShape4D(transpose->output(0));  // [B,S,H,D]
+  if (!reshape || !merged_from) return;
+  const ov::Shape& s = *merged_from;
+  const ov::Shape head_merged{s[0], s[1], s[2] * s[3]};
+  const auto& out_ps = reshape->get_output_partial_shape(0);
+  if (out_ps.is_dynamic() || out_ps.to_shape() == head_merged) return;
+  auto pattern = ov::op::v0::Constant::create(
+      ov::element::i64, ov::Shape{3},
+      std::vector<int64_t>(head_merged.begin(), head_merged.end()));
+  auto merged = std::make_shared<ov::op::v1::Reshape>(transpose, pattern,
+                                                      /*special_zero=*/false);
+  ov::copy_runtime_info(reshape, {pattern, merged});
+  reshape->input(0).replace_source_output(merged);
+}
+
+// Rows of one copy when |mask| is n >= 2 copies of one [1,1,S,KV] source
+// stacked on axis 2 (the GQA row tiling) with n * S == |q_rows|, looking
+// through the KV-alignment Pad; nullopt otherwise.
+std::optional<size_t> TiledMaskRows(ov::Output<ov::Node> mask, size_t q_rows) {
+  if (ov::is_type<ov::op::v1::Pad>(mask.get_node_shared_ptr())) {
+    mask = mask.get_node_shared_ptr()->input_value(0);
+  }
+  auto concat =
+      std::dynamic_pointer_cast<ov::op::v0::Concat>(mask.get_node_shared_ptr());
+  if (!concat || concat->get_input_size() < 2) return std::nullopt;
+  int64_t axis = concat->get_axis();
+  if (axis < 0) axis += 4;
+  if (axis != 2) return std::nullopt;
+  const auto src = concat->input_value(0);
+  for (const auto& in : concat->input_values()) {
+    if (in != src) return std::nullopt;
+  }
+  const auto shape = StaticShape4D(src);
+  if (!shape || (*shape)[2] * concat->get_input_size() != q_rows) {
+    return std::nullopt;
+  }
+  return (*shape)[2];
+}
+
 // Number of query tokens |sdpa| attends for, given its static Q shape
 // [B,H,S,D]. A Q folded by the GQA ratio r into the sequence axis counts S / r.
 size_t QueryTokenCount(const ov::op::v13::ScaledDotProductAttention& sdpa,
                        const ov::Shape& q_shape) {
   const auto q = sdpa.get_input_node_shared_ptr(0);
   if (IsSingleTokenGqaFoldReshape(q)) return 1;
+  // With Hkv == 1 a decode step's token-major fold [1,1,Hq,D] -> [1,1,Hq,D]
+  // is the identity, so the graph no longer has it; the mask still has one
+  // row per token, tiled once per query head.
+  if (sdpa.get_input_size() >= 4) {
+    if (const auto rows = TiledMaskRows(sdpa.input_value(3), q_shape[2])) {
+      return *rows;
+    }
+  }
   const auto r = MatchGqaFoldReshape(q);
   return r ? q_shape[2] / static_cast<size_t>(*r) : q_shape[2];
 }
@@ -1933,6 +2097,7 @@ bool DecomposeSDPAForHFA::run_on_model(
     out->set_friendly_name(name);
     ov::copy_runtime_info(sdpa, created);
     ov::replace_node(sdpa, out);
+    InsertHeadMergeReshape(out);
     LITERT_LOG(LITERT_DEBUG,
                "DecomposeSDPAForHFA: decomposed '%s' (scale=%g, "
                "k_stored_transposed=%d, v_stored_transposed=%d)",

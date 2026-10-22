@@ -19,6 +19,7 @@
 #include <chrono>  // NOLINT
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <cstring>
 #include <exception>
 #include <ios>
@@ -59,6 +60,23 @@
 #include "litert/vendors/intel_openvino/openvino_version_info.h"
 
 namespace {
+// Wall-clock budget for one infer request: |default_ms|, or
+// LITERT_INTEL_OPENVINO_INFER_TIMEOUT_MS when set to a positive integer.
+// wait_for() does not cancel, so on expiry a slow request is reported as a
+// failure while the NPU keeps running it; the override lets a slow first
+// inference be measured instead.
+std::chrono::milliseconds InferRequestTimeout(int default_ms) {
+  static const int ms = [default_ms] {
+    const char* env = std::getenv("LITERT_INTEL_OPENVINO_INFER_TIMEOUT_MS");
+    const int v = env != nullptr ? std::atoi(env) : 0;
+    if (v > 0) {
+      LITERT_LOG(LITERT_INFO, "Infer request timeout: %d ms (from env)", v);
+    }
+    return v > 0 ? v : default_ms;
+  }();
+  return std::chrono::milliseconds(ms);
+}
+
 // This class is copied from the OpenVINO codebase with minor modifications
 // for Google C++ Style Guide compliance. It wraps a pre-allocated memory
 // buffer to provide a std::streambuf interface, enabling zero-copy stream
@@ -630,8 +648,8 @@ litert::Expected<void> LiteRtDispatchInvocationContextT::Invoke() {
     // release the HAL context and the infer-request wrapper it borrowed. Per
     // the HAL contract the wrapper (owned by unique_ptr, freed at scope exit)
     // must outlive npu_hal_release_context().
-    const bool completed = infer_request_.wait_for(
-        std::chrono::milliseconds(kInferRequestTimeoutMs));
+    const bool completed =
+        infer_request_.wait_for(InferRequestTimeout(kInferRequestTimeoutMs));
     if (ctx != nullptr) {
       if (npu_hal_hooks.release_context != nullptr) {
         npu_hal_hooks.release_context(ctx);
@@ -647,8 +665,7 @@ litert::Expected<void> LiteRtDispatchInvocationContextT::Invoke() {
   }
 #endif
   infer_request_.start_async();
-  if (!infer_request_.wait_for(
-          std::chrono::milliseconds(kInferRequestTimeoutMs)))
+  if (!infer_request_.wait_for(InferRequestTimeout(kInferRequestTimeoutMs)))
     return litert::Unexpected(
         kLiteRtStatusErrorRuntimeFailure,
         "Failed to execute inference request due to timeout");

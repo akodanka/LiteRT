@@ -123,6 +123,40 @@ TEST(OpenVinoCompileContextHfaTest, WeightSharingKeepsExplicitNpuwAttn) {
   EXPECT_EQ(Get(context, "NPUW_ATTN"), "STATIC");
 }
 
+const OpenVinoCompileContext::OptimizeModelResult kDensePrefill = {
+    .moe_is_multi_token_chunk = false, .num_sdpa_decomposed_for_hfa = 47};
+const OpenVinoCompileContext::OptimizeModelResult kDenseDecode = {
+    .moe_is_multi_token_chunk = false, .num_sdpa_decomposed_for_hfa = 0};
+
+TEST(OpenVinoCompileContextHfaTest, WeightSharingGivesDenseHfaGraphRep) {
+  // Under NONE a dense prefill is one function with no attention block to
+  // convert, so HFA needs REP with attention (and no MoE) isolated.
+  auto prefill = ContextFor({{"enable_hfa", "true"}}, {}, /*graph_index=*/0);
+  prefill.ConfigureForNpuWeightSharing(kDensePrefill);
+  EXPECT_EQ(Get(prefill, "NPUW_ATTN"), "HFA");
+  EXPECT_EQ(Get(prefill, "NPUW_ONLINE_PIPELINE"), "REP");
+  EXPECT_EQ(Get(prefill, "NPUW_ONLINE_ISOLATE"), "ATTN");
+  EXPECT_EQ(Get(prefill, "NPUW_FOLD"), "YES");
+  EXPECT_EQ(Get(prefill, "NPUW_MOE_TOKEN_CHUNK_SIZE"), "");
+  EXPECT_EQ(Get(prefill, "NPUW_CWAI"), "");
+
+  auto decode = ContextFor({{"enable_hfa", "true"}}, {}, /*graph_index=*/1);
+  decode.ConfigureForNpuWeightSharing(kDenseDecode);
+  EXPECT_EQ(Get(decode, "NPUW_ATTN"), "");
+  EXPECT_EQ(Get(decode, "NPUW_ONLINE_PIPELINE"), "NONE");
+  EXPECT_EQ(Get(decode, "NPUW_CWAI"), "YES");
+}
+
+TEST(OpenVinoCompileContextHfaTest, WeightSharingGivesDenseStaticControlRep) {
+  // A STATIC control over the same decomposed graph gets the same pipeline.
+  auto context = ContextFor({{"enable_hfa", "true"}}, {{"NPUW_ATTN", "STATIC"}},
+                            /*graph_index=*/0);
+  context.ConfigureForNpuWeightSharing(kDensePrefill);
+  EXPECT_EQ(Get(context, "NPUW_ATTN"), "STATIC");
+  EXPECT_EQ(Get(context, "NPUW_ONLINE_PIPELINE"), "REP");
+  EXPECT_EQ(Get(context, "NPUW_ONLINE_ISOLATE"), "ATTN");
+}
+
 }  // namespace
 }  // namespace openvino
 }  // namespace litert

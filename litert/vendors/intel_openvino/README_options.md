@@ -128,8 +128,10 @@ properties. Internal keys (all default `false`):
     a K/V cache stored as `[B,H,D,S]` through `transpose_b` instead of an
     explicit Transpose. Under NPU weight sharing, every graph that had SDPAs
     rewritten also gets `NPUW_ATTN=HFA`; the other graphs keep NPUW's `STATIC`
-    default. HFA needs NPUW's repeated-blocks pipeline, which NPU weight
-    sharing selects only for multi-token MoE graphs. An explicit `NPUW_ATTN`
+    default. HFA needs NPUW's repeated-blocks pipeline, so those graphs also
+    get `NPUW_ONLINE_PIPELINE=REP` with attention isolated, MoE or dense
+    (other dense graphs keep the single-function CWAI pipeline). An explicit
+    `NPUW_ATTN`
     (model-wide or per graph) is kept, and a per-graph `N:enable_hfa=false`
     opts graph `N` out. `NPUW_ATTN=HFA` alone does not enable HFA: the
     attention stays fused, which NPUW cannot convert.

@@ -66,9 +66,11 @@ class OpenVinoCompileContext {
   // export_model emits a WEIGHTLESS blob (constants referenced by
   // WeightlessCacheAttribute bin_offset rather than baked in).
   // |result| (from OptimizeModel) selects the NPUW pipeline: a multi-token
-  // MoE chunk gets the host-router/REP pipeline, anything else gets the plain
-  // CWAI pipeline. A graph with SDPAs decomposed for HFA also gets
-  // NPUW_ATTN=HFA unless NPUW_ATTN was set explicitly.
+  // MoE chunk gets the host-router/REP pipeline with attention and MoE
+  // isolated, a graph with SDPAs decomposed for HFA gets REP with attention
+  // isolated, anything else gets the plain CWAI pipeline. A graph with SDPAs
+  // decomposed for HFA also gets NPUW_ATTN=HFA unless NPUW_ATTN was set
+  // explicitly.
   void ConfigureForNpuWeightSharing(const OptimizeModelResult& result);
 
   // Runs NPU-specific optimization passes on the given OV model.
