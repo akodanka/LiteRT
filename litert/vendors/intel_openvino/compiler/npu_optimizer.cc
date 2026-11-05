@@ -1962,6 +1962,44 @@ std::shared_ptr<ov::op::v0::Parameter> MaskInput(ov::Output<ov::Node> mask) {
   }
 }
 
+// NPUW's HFA ends the attention block (MatMul -> Transpose -> Reshape) with a
+// [B,S,H*D] output. An export that merges the heads straight into [B*S,H*D]
+// would leave the block's real output shaped unlike HFA's, which the NPU
+// rejects at the first infer ("got [1,1024,4096] expecting [1024,4096]").
+// So when |pv| ([B,H,S,D]) feeds only Transpose(0,2,1,3) -> Reshape to some
+// other shape, route it through a Reshape to [B,S,H*D] first.
+void InsertHeadMergeReshape(const std::shared_ptr<ov::Node>& pv) {
+  auto only_consumer = [](const ov::Output<ov::Node>& out) {
+    return HasSingleConsumer(out)
+               ? out.get_target_inputs().begin()->get_node()->shared_from_this()
+               : nullptr;
+  };
+  auto transpose = std::dynamic_pointer_cast<ov::op::v1::Transpose>(
+      only_consumer(pv->output(0)));
+  if (!transpose) return;
+  auto order = std::dynamic_pointer_cast<ov::op::v0::Constant>(
+      transpose->get_input_node_shared_ptr(1));
+  if (!order ||
+      order->cast_vector<int64_t>() != std::vector<int64_t>{0, 2, 1, 3}) {
+    return;
+  }
+  auto reshape = std::dynamic_pointer_cast<ov::op::v1::Reshape>(
+      only_consumer(transpose->output(0)));
+  const auto merged_from = StaticShape4D(transpose->output(0));  // [B,S,H,D]
+  if (!reshape || !merged_from) return;
+  const ov::Shape& s = *merged_from;
+  const ov::Shape head_merged{s[0], s[1], s[2] * s[3]};
+  const auto& out_ps = reshape->get_output_partial_shape(0);
+  if (out_ps.is_dynamic() || out_ps.to_shape() == head_merged) return;
+  auto pattern = ov::op::v0::Constant::create(
+      ov::element::i64, ov::Shape{3},
+      std::vector<int64_t>(head_merged.begin(), head_merged.end()));
+  auto merged = std::make_shared<ov::op::v1::Reshape>(transpose, pattern,
+                                                      /*special_zero=*/false);
+  ov::copy_runtime_info(reshape, {pattern, merged});
+  reshape->input(0).replace_source_output(merged);
+}
+
 }  // namespace
 
 bool DecomposeSDPAForHFA::run_on_model(
@@ -2064,6 +2102,7 @@ bool DecomposeSDPAForHFA::run_on_model(
     out->set_friendly_name(name);
     ov::copy_runtime_info(sdpa, created);
     ov::replace_node(sdpa, out);
+    InsertHeadMergeReshape(out);
     LITERT_LOG(LITERT_DEBUG,
                "DecomposeSDPAForHFA: decomposed '%s' (scale=%g, "
                "k_stored_transposed=%d, v_stored_transposed=%d)",

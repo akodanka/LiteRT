@@ -1519,6 +1519,55 @@ TEST(DecomposeSDPAForHFATest, DecomposesFp16BroadcastMaskForm) {
   EXPECT_EQ(CountOps<ov::op::v13::ScaledDotProductAttention>(decode), 1u);
 }
 
+// An attention output merged straight into [S,H*D] gets a [1,S,H*D] Reshape
+// in between, the shape NPUW's HFA gives its attention block's output; one
+// already merged into [1,S,H*D] is left alone.
+TEST(DecomposeSDPAForHFATest, MergesHeadsToThreeDimsBeforeFlatReshape) {
+  using ov::op::v0::Constant;
+  using ov::op::v0::Parameter;
+  const auto f = ov::element::f32;
+  for (const bool flat : {true, false}) {
+    auto q = std::make_shared<Parameter>(f, ov::Shape{1, 2, 4, 8});
+    auto k = std::make_shared<Parameter>(f, ov::Shape{1, 2, 16, 8});
+    auto v = std::make_shared<Parameter>(f, ov::Shape{1, 2, 16, 8});
+    auto mask = std::make_shared<Parameter>(f, ov::Shape{1, 1, 4, 16});
+    auto sdpa = std::make_shared<ov::op::v13::ScaledDotProductAttention>(
+        ov::OutputVector{q, k, v, mask}, /*causal=*/false);
+    auto transpose = std::make_shared<ov::op::v1::Transpose>(
+        sdpa, Constant::create(ov::element::i64, ov::Shape{4},
+                               std::vector<int64_t>{0, 2, 1, 3}));
+    const std::vector<int64_t> out_shape =
+        flat ? std::vector<int64_t>{4, 16} : std::vector<int64_t>{1, 4, 16};
+    auto merged = std::make_shared<ov::op::v1::Reshape>(
+        transpose,
+        Constant::create(ov::element::i64, ov::Shape{out_shape.size()},
+                         out_shape),
+        /*special_zero=*/false);
+    auto reference = std::make_shared<ov::Model>(
+        ov::OutputVector{merged->output(0)},
+        ov::ParameterVector{q, k, v, mask}, "sdpa_merge");
+    auto rewritten = reference->clone();
+    NpuOptimizer()
+        .SetCastIntegerSignToFloat(false)
+        .SetDecomposeSDPAForHFA(true)
+        .Run(rewritten);
+
+    auto last = rewritten->output(0).get_node_shared_ptr()->input_value(0)
+                    .get_node_shared_ptr();
+    ASSERT_TRUE(ov::is_type<ov::op::v1::Reshape>(last));
+    auto before = last->get_input_node_shared_ptr(0);
+    if (flat) {
+      ASSERT_TRUE(ov::is_type<ov::op::v1::Reshape>(before));
+      EXPECT_EQ(before->get_output_shape(0), (ov::Shape{1, 4, 16}));
+      EXPECT_TRUE(ov::is_type<ov::op::v1::Transpose>(
+          before->get_input_node_shared_ptr(0)));
+    } else {
+      EXPECT_TRUE(ov::is_type<ov::op::v1::Transpose>(before));
+    }
+    ExpectSameOutputs(reference, rewritten);
+  }
+}
+
 // A V slice Convert that also feeds a graph output is copied for the fused
 // attention, so the attention's KV Concat reads a Convert no other node reads.
 TEST(FuseSplitAttentionToSDPATest, GivesKvConcatPrivateSliceConvert) {
