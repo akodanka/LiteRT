@@ -1390,10 +1390,13 @@ TEST(DecomposeSDPAForHFATest, TagsNothingWithoutDecomposedMaskInput) {
 //     + Reshape(mask [1,1,S,KV] -> [1,1,1,S,KV]) -> Reshape back -> Softmax
 //     -> Convert(f16) -> Slices.
 // The f32 inputs are converted to f16 in the graph and the output back to f32,
-// so ExpectSameOutputs can feed and read it.
+// so ExpectSameOutputs can feed and read it. With |v_new_is_output| the f16
+// V slice is also a second output, as the export's cache update is: one
+// Convert then feeds both that Result and the attention.
 // Inputs, in order: {q, k_cache, k_new, v_cache, v_new, mask}.
 std::shared_ptr<ov::Model> BuildFp16BroadcastMaskAttention(
-    int64_t hkv, int64_t r, int64_t s_past, int64_t s, int64_t head_dim) {
+    int64_t hkv, int64_t r, int64_t s_past, int64_t s, int64_t head_dim,
+    bool v_new_is_output = false) {
   using ov::op::v0::Concat;
   using ov::op::v0::Constant;
   using ov::op::v0::Convert;
@@ -1457,9 +1460,10 @@ std::shared_ptr<ov::Model> BuildFp16BroadcastMaskAttention(
 
   auto unfolded = std::make_shared<Reshape>(out, shape({1, hq, s, head_dim}),
                                             /*special_zero=*/false);
+  ov::OutputVector outputs{std::make_shared<Convert>(unfolded, f)->output(0)};
+  if (v_new_is_output) outputs.push_back(v_new_f16->output(0));
   return std::make_shared<ov::Model>(
-      ov::OutputVector{std::make_shared<Convert>(unfolded, f)->output(0)},
-      ov::ParameterVector{q, k_cache, k_new, v_cache, v_new, mask},
+      outputs, ov::ParameterVector{q, k_cache, k_new, v_cache, v_new, mask},
       "fp16_broadcast_mask_attention");
 }
 
@@ -1513,6 +1517,38 @@ TEST(DecomposeSDPAForHFATest, DecomposesFp16BroadcastMaskForm) {
   const auto decode_result = RunDecompose(decode, /*unfold=*/true);
   EXPECT_EQ(decode_result.num_sdpa_decomposed_for_hfa, 0u);
   EXPECT_EQ(CountOps<ov::op::v13::ScaledDotProductAttention>(decode), 1u);
+}
+
+// A V slice Convert that also feeds a graph output is copied for the fused
+// attention, so the attention's KV Concat reads a Convert no other node reads.
+TEST(FuseSplitAttentionToSDPATest, GivesKvConcatPrivateSliceConvert) {
+  auto reference = BuildFp16BroadcastMaskAttention(
+      /*hkv=*/2, /*r=*/4, /*s_past=*/12, /*s=*/4, /*head_dim=*/8,
+      /*v_new_is_output=*/true);
+  auto model = reference->clone();
+  Gemma4AttentionPasses(/*decompose=*/true).Run(model);
+  EXPECT_EQ(CountOps<ov::op::v13::ScaledDotProductAttention>(model), 0u);
+
+  const auto slice_out = model->output(1).get_node_shared_ptr()->input_value(0);
+  ASSERT_TRUE(
+      ov::is_type<ov::op::v0::Convert>(slice_out.get_node_shared_ptr()));
+  EXPECT_EQ(slice_out.get_target_inputs().size(), 1u)
+      << "the Result's Convert must feed only the Result";
+  size_t private_converts = 0;
+  for (const auto& node : model->get_ops()) {
+    auto concat = std::dynamic_pointer_cast<ov::op::v0::Concat>(node);
+    if (!concat) continue;
+    for (const auto& in : concat->input_values()) {
+      if (ov::is_type<ov::op::v0::Convert>(in.get_node_shared_ptr()) &&
+          in.get_node_shared_ptr()->input_value(0) ==
+              slice_out.get_node_shared_ptr()->input_value(0)) {
+        EXPECT_EQ(in.get_target_inputs().size(), 1u);
+        ++private_converts;
+      }
+    }
+  }
+  EXPECT_EQ(private_converts, 1u);
+  ExpectSameOutputs(reference, model, /*rel=*/1e-2f, /*abs=*/1e-3f);
 }
 
 // A 5-D view whose mask is not broadcast over the groups (one mask row per

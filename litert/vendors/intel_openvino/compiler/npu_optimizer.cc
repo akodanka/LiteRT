@@ -461,6 +461,24 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
       return false;
     }
 
+    // The new K/V slice is also a graph output (the cache update). In an fp16
+    // export the frontend's TransposeSinking leaves it as a Convert shared by
+    // that Result and this attention. NPUW isolates a KV Concat's Convert
+    // inputs into the attention block while the producing block keeps the
+    // Result's Convert, so one shared Convert would sit in two blocks (NPUW:
+    // "Model references undeclared parameters"). Give the Concat its own copy.
+    ov::NodeVector new_nodes;
+    auto private_convert = [&new_nodes](const ov::Output<ov::Node>& in) {
+      auto convert = std::dynamic_pointer_cast<ov::op::v0::Convert>(
+          in.get_node_shared_ptr());
+      if (!convert || HasSingleConsumer(in)) return in;
+      auto copy = convert->clone_with_new_inputs({convert->input_value(0)});
+      new_nodes.push_back(copy);
+      return copy->output(0);
+    };
+    k_new = private_convert(k_new);
+    v_new = private_convert(v_new);
+
     auto k_concat = std::make_shared<ov::op::v0::Concat>(
         ov::OutputVector{k_cache, k_new}, k_concat_axis);
     auto v_concat = std::make_shared<ov::op::v0::Concat>(
@@ -469,7 +487,7 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
     std::shared_ptr<ov::Node> k_input = k_concat;
     std::shared_ptr<ov::Node> v_input = v_concat;
 
-    ov::NodeVector new_nodes{k_concat, v_concat};
+    new_nodes.insert(new_nodes.end(), {k_concat, v_concat});
     auto add_transpose = [&new_nodes](std::shared_ptr<ov::Node>& target) {
       auto perm = ov::op::v0::Constant::create(ov::element::i64, ov::Shape{4},
                                                {0, 1, 3, 2});
