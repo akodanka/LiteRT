@@ -117,6 +117,10 @@ ov::Output<ov::Node> PadEndOfAxis(const ov::Output<ov::Node>& input,
       ->output(0);
 }
 
+// Defined with UnfoldGqaSequenceFold below.
+std::optional<ov::Output<ov::Node>> MatchTiledMask(
+    const ov::Output<ov::Node>& mask, int64_t r);
+
 }  // namespace
 
 EliminateMatMulFakeQuantize::EliminateMatMulFakeQuantize() {
@@ -273,7 +277,7 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
     }
 
     // The scores are masked in one of two forms:
-    //   Add(Concat, mask)                              mask [1,1,r*S,KV] or
+    //   Add([Convert](Concat), mask)                   mask [1,1,r*S,KV] or
     //                                                  broadcastable to it
     //   Reshape(Add([Convert](Reshape5(Concat)), Reshape5(mask)))
     //       the scores [1,H,r*S,KV] viewed as [1,H,r,S,KV] and a [1,1,S,KV]
@@ -327,7 +331,8 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
       if (!mask_add_node) {
         return false;
       }
-      scores_node = mask_add_node->input_value(0).get_node_shared_ptr();
+      scores_node =
+          skip_convert(mask_add_node->input_value(0)).get_node_shared_ptr();
       mask_value = mask_add_node->input_value(1);
     }
 
@@ -514,21 +519,31 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
       new_nodes.push_back(val_out.get_node_shared_ptr());
     }
 
+    // The mask is converted and padded once and only then tiled, so the tile
+    // stays a Concat of one source: UnfoldGqaSequenceFold matches only that
+    // (not a Convert or Pad over the tile). A mask the export already tiled
+    // r times is untiled first if it needs either; otherwise it is kept.
+    const bool convert_mask =
+        mask_value.get_element_type() != q.get_element_type();
+    if (mask_groups == 1 && (convert_mask || kv_pad > 0)) {
+      const auto copies = static_cast<int64_t>(
+          mask_value.get_node_shared_ptr()->get_input_size());
+      if (ov::is_type<ov::op::v0::Concat>(mask_value.get_node_shared_ptr()) &&
+          copies >= 2) {
+        if (const auto source = MatchTiledMask(mask_value, copies)) {
+          mask_value = *source;
+          mask_groups = copies;
+        }
+      }
+    }
+
     // SDPA takes an additive mask of Q's type (the f32 mask of an fp16
-    // export; -100 is exact in f16). Convert before tiling so the tile stays
-    // a Concat of one source.
-    if (mask_value.get_element_type() != q.get_element_type()) {
+    // export; -100 is exact in f16).
+    if (convert_mask) {
       auto convert = std::make_shared<ov::op::v0::Convert>(
           mask_value, q.get_element_type());
       new_nodes.push_back(convert);
       mask_value = convert->output(0);
-    }
-    if (mask_groups > 1) {
-      auto tiled = std::make_shared<ov::op::v0::Concat>(
-          ov::OutputVector(static_cast<size_t>(mask_groups), mask_value),
-          /*axis=*/2);
-      new_nodes.push_back(tiled);
-      mask_value = tiled->output(0);
     }
 
     // Mask. Its KV axis (-1) must match the (possibly padded) KV length, so
@@ -544,6 +559,14 @@ FuseSplitAttentionToSDPA::FuseSplitAttentionToSDPA(bool pad_kv_to_alignment) {
         mask_value, mask_rank, /*axis=*/-1, kv_pad, kSdpaPadMaskBias);
     if (kv_pad > 0) {
       new_nodes.push_back(attn_mask.get_node_shared_ptr());
+    }
+
+    if (mask_groups > 1) {
+      auto tiled = std::make_shared<ov::op::v0::Concat>(
+          ov::OutputVector(static_cast<size_t>(mask_groups), attn_mask),
+          /*axis=*/2);
+      new_nodes.push_back(tiled);
+      attn_mask = tiled->output(0);
     }
 
     // Scale = 1.0: any required scaling is assumed pre-applied to Q.
